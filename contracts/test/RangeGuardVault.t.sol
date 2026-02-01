@@ -9,7 +9,7 @@ import { RangeGuardVault } from "../src/RangeGuardVault.sol";
 import { MockERC20 } from "./mocks/MockERC20.sol";
 
 /// @title RangeGuardVaultTest
-/// @notice Day-1 unit tests for RangeGuardVault.
+/// @notice Unit tests for RangeGuardVault.
 contract RangeGuardVaultTest is Test {
     MockERC20 private token0;
     MockERC20 private token1;
@@ -43,6 +43,17 @@ contract RangeGuardVaultTest is Test {
         new RangeGuardVault(address(tokenHighDecimals), address(token1), owner, keeper);
     }
 
+    function test_constructor_emits_initialized_event() public {
+        uint256 nonce = vm.getNonce(address(this));
+        address expected = vm.computeCreateAddress(address(this), nonce);
+
+        vm.expectEmit(true, true, true, true, expected);
+        emit RangeGuardVault.RangeGuardVaultInitialized(address(token0), address(token1), owner, keeper);
+
+        RangeGuardVault newVault = new RangeGuardVault(address(token0), address(token1), owner, keeper);
+        assertEq(address(newVault), expected);
+    }
+
     function test_deposit_token0_and_token1() public {
         uint256 amount0 = 1000;
         uint256 amount1 = 2000;
@@ -54,11 +65,11 @@ contract RangeGuardVaultTest is Test {
         token0.approve(address(vault), amount0);
         token1.approve(address(vault), amount1);
 
-        vm.expectEmit(true, true, false, true);
+        vm.expectEmit(true, true, false, true, address(vault));
         emit RangeGuardVault.AssetFunded(user, address(token0), amount0);
         vault.deposit(address(token0), amount0);
 
-        vm.expectEmit(true, true, false, true);
+        vm.expectEmit(true, true, false, true, address(vault));
         emit RangeGuardVault.AssetFunded(user, address(token1), amount1);
         vault.deposit(address(token1), amount1);
         vm.stopPrank();
@@ -70,6 +81,9 @@ contract RangeGuardVaultTest is Test {
     function test_deposit_reverts() public {
         vm.expectRevert(RangeGuardVault.ZeroAmount.selector);
         vault.deposit(address(token0), 0);
+
+        vm.expectRevert(RangeGuardVault.ZeroAddress.selector);
+        vault.deposit(address(0), 1);
 
         vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.AssetNotAllowed.selector, address(tokenBad)));
         vault.deposit(address(tokenBad), 100);
@@ -86,7 +100,7 @@ contract RangeGuardVaultTest is Test {
         token0.mint(address(vault), amount);
 
         vm.prank(owner);
-        vm.expectEmit(true, true, false, true);
+        vm.expectEmit(true, true, false, true, address(vault));
         emit RangeGuardVault.AssetWithdrawn(address(token0), recipient, amount);
         vault.withdraw(address(token0), amount, recipient);
 
@@ -97,6 +111,10 @@ contract RangeGuardVaultTest is Test {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, user));
         vm.prank(user);
         vault.withdraw(address(token0), 1, recipient);
+
+        vm.prank(owner);
+        vm.expectRevert(RangeGuardVault.ZeroAddress.selector);
+        vault.withdraw(address(0), 1, recipient);
 
         vm.prank(owner);
         vm.expectRevert(RangeGuardVault.ZeroAmount.selector);
@@ -116,14 +134,16 @@ contract RangeGuardVaultTest is Test {
         vm.prank(user);
         vault.setKeeper(address(0x1234));
 
+        uint256 beforePolicy = vault.policyVersion();
         bytes32 beforeHash = vault.hashPolicy();
 
         vm.prank(owner);
-        vm.expectEmit(true, true, false, true);
+        vm.expectEmit(true, true, false, true, address(vault));
         emit RangeGuardVault.KeeperUpdated(keeper, address(0x1234));
         vault.setKeeper(address(0x1234));
 
         assertEq(vault.keeper(), address(0x1234));
+        assertEq(vault.policyVersion(), beforePolicy + 1);
         assertTrue(beforeHash != vault.hashPolicy());
     }
 
@@ -136,13 +156,15 @@ contract RangeGuardVaultTest is Test {
         vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.InvalidBps.selector, uint16(10_001)));
         vault.setMaxSlippageBps(10_001);
 
+        uint256 beforePolicy = vault.policyVersion();
         bytes32 beforeHash = vault.hashPolicy();
         vm.prank(owner);
-        vm.expectEmit(false, false, false, true);
+        vm.expectEmit(false, false, false, true, address(vault));
         emit RangeGuardVault.MaxSlippageUpdated(200);
         vault.setMaxSlippageBps(200);
 
         assertEq(vault.maxSlippageBps(), 200);
+        assertEq(vault.policyVersion(), beforePolicy + 1);
         assertTrue(beforeHash != vault.hashPolicy());
     }
 
@@ -163,9 +185,14 @@ contract RangeGuardVaultTest is Test {
         vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.TickNotAligned.selector, int24(-15), int24(10)));
         vault.setPositionState(1, -15, 20, 10);
 
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.TickNotAligned.selector, int24(25), int24(10)));
+        vault.setPositionState(1, -20, 25, 10);
+
+        uint256 beforePolicy = vault.policyVersion();
         bytes32 beforeHash = vault.hashPolicy();
         vm.prank(owner);
-        vm.expectEmit(true, false, false, true);
+        vm.expectEmit(true, false, false, true, address(vault));
         emit RangeGuardVault.PositionStateUpdated(42, -20, 20, 10);
         vault.setPositionState(42, -20, 20, 10);
 
@@ -175,6 +202,7 @@ contract RangeGuardVaultTest is Test {
         assertEq(spacing, 10);
         assertEq(positionId, 42);
         assertTrue(vault.isPositionInitialized());
+        assertEq(vault.policyVersion(), beforePolicy + 1);
         assertTrue(beforeHash != vault.hashPolicy());
     }
 
@@ -183,8 +211,12 @@ contract RangeGuardVaultTest is Test {
         vm.prank(user);
         vault.pause();
 
+        uint256 beforePausePolicy = vault.policyVersion();
+        bytes32 beforePauseHash = vault.hashPolicy();
         vm.prank(owner);
         vault.pause();
+        assertEq(vault.policyVersion(), beforePausePolicy + 1);
+        assertTrue(beforePauseHash != vault.hashPolicy());
 
         token0.mint(user, 100);
         vm.prank(user);
@@ -198,8 +230,12 @@ contract RangeGuardVaultTest is Test {
         vault.withdraw(address(token0), 50, recipient);
         assertEq(token0.balanceOf(recipient), 50);
 
+        uint256 beforeUnpausePolicy = vault.policyVersion();
+        bytes32 beforeUnpauseHash = vault.hashPolicy();
         vm.prank(owner);
         vault.unpause();
+        assertEq(vault.policyVersion(), beforeUnpausePolicy + 1);
+        assertTrue(beforeUnpauseHash != vault.hashPolicy());
     }
 
     function test_withdraw_eth() public {
@@ -208,7 +244,7 @@ contract RangeGuardVaultTest is Test {
         vm.deal(recipient, 0);
 
         vm.prank(owner);
-        vm.expectEmit(true, false, false, true);
+        vm.expectEmit(true, false, false, true, address(vault));
         emit RangeGuardVault.EthWithdrawn(recipient, amount);
         vault.withdrawETH(amount, recipient);
 
@@ -216,13 +252,38 @@ contract RangeGuardVaultTest is Test {
         assertEq(recipient.balance, amount);
     }
 
+    function test_withdraw_eth_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, user));
+        vm.prank(user);
+        vault.withdrawETH(1 ether, recipient);
+
+        vm.prank(owner);
+        vm.expectRevert(RangeGuardVault.ZeroAmount.selector);
+        vault.withdrawETH(0, recipient);
+
+        vm.prank(owner);
+        vm.expectRevert(RangeGuardVault.ZeroAddress.selector);
+        vault.withdrawETH(1 ether, address(0));
+    }
+
+    function test_withdraw_eth_reverts_on_transfer_failure() public {
+        RejectETH rejector = new RejectETH();
+        vm.deal(address(vault), 1 ether);
+
+        vm.prank(owner);
+        vm.expectRevert(RangeGuardVault.EthTransferFailed.selector);
+        vault.withdrawETH(1 ether, address(rejector));
+    }
+
     function test_clear_position_state() public {
         vm.prank(owner);
         vault.setPositionState(42, -20, 20, 10);
         assertTrue(vault.isPositionInitialized());
 
+        uint256 beforePolicy = vault.policyVersion();
+        bytes32 beforeHash = vault.hashPolicy();
         vm.prank(owner);
-        vm.expectEmit(false, false, false, true);
+        vm.expectEmit(false, false, false, true, address(vault));
         emit RangeGuardVault.PositionStateCleared();
         vault.clearPositionState();
 
@@ -232,5 +293,42 @@ contract RangeGuardVaultTest is Test {
         assertEq(spacing, 0);
         assertEq(positionId, 0);
         assertFalse(vault.isPositionInitialized());
+        assertEq(vault.policyVersion(), beforePolicy + 1);
+        assertTrue(beforeHash != vault.hashPolicy());
+    }
+
+    function test_deposit_after_unpause() public {
+        vm.prank(owner);
+        vault.pause();
+
+        vm.prank(owner);
+        vault.unpause();
+
+        token0.mint(user, 100);
+        vm.startPrank(user);
+        token0.approve(address(vault), 100);
+        vault.deposit(address(token0), 100);
+        vm.stopPrank();
+
+        assertEq(token0.balanceOf(address(vault)), 100);
+    }
+
+    function test_balance_of_reverts_for_unsupported_asset() public {
+        vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.AssetNotAllowed.selector, address(tokenBad)));
+        vault.balanceOf(address(tokenBad));
+    }
+
+    function test_balance_of_returns_balances() public {
+        token0.mint(address(vault), 111);
+        token1.mint(address(vault), 222);
+
+        assertEq(vault.balanceOf(address(token0)), 111);
+        assertEq(vault.balanceOf(address(token1)), 222);
+    }
+}
+
+contract RejectETH {
+    receive() external payable {
+        revert("nope");
     }
 }

@@ -76,6 +76,12 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
     /// @param to Recipient of the ETH withdrawal.
     /// @param amount Amount of ETH withdrawn.
     event EthWithdrawn(address indexed to, uint256 amount);
+    /// @notice Emitted when the vault is initialized.
+    /// @param token0 Token0 address.
+    /// @param token1 Token1 address.
+    /// @param owner Owner address.
+    /// @param keeper Keeper address.
+    event RangeGuardVaultInitialized(address token0, address token1, address owner, address keeper);
 
     /// @notice Position metadata for the vault.
     struct PositionState {
@@ -129,6 +135,8 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
 
         keeper = _keeper;
         maxSlippageBps = 30;
+
+        emit RangeGuardVaultInitialized(_token0, _token1, _owner, _keeper);
     }
 
     /// @notice Accept ETH transfers for future use.
