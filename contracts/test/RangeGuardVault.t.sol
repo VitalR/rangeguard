@@ -7,6 +7,7 @@ import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 
 import { RangeGuardVault } from "../src/RangeGuardVault.sol";
 import { MockERC20 } from "./mocks/MockERC20.sol";
+import { MockPositionManager } from "./mocks/MockPositionManager.sol";
 
 /// @title RangeGuardVaultTest
 /// @notice Unit tests for RangeGuardVault.
@@ -14,6 +15,7 @@ contract RangeGuardVaultTest is Test {
     MockERC20 private token0;
     MockERC20 private token1;
     MockERC20 private tokenBad;
+    MockPositionManager private positionManager;
     RangeGuardVault private vault;
 
     address private owner = address(0xA11CE);
@@ -25,22 +27,26 @@ contract RangeGuardVaultTest is Test {
         token0 = new MockERC20("Token0", "TK0", 6);
         token1 = new MockERC20("Token1", "TK1", 18);
         tokenBad = new MockERC20("Bad", "BAD", 18);
-        vault = new RangeGuardVault(address(token0), address(token1), owner, keeper);
+        positionManager = new MockPositionManager(address(token0), address(token1));
+        vault = new RangeGuardVault(address(token0), address(token1), owner, keeper, address(positionManager));
     }
 
     function test_constructor_validations() public {
         vm.expectRevert(RangeGuardVault.ZeroAddress.selector);
-        new RangeGuardVault(address(0), address(token1), owner, keeper);
+        new RangeGuardVault(address(0), address(token1), owner, keeper, address(positionManager));
 
         vm.expectRevert(RangeGuardVault.ZeroAddress.selector);
-        new RangeGuardVault(address(token0), address(0), owner, keeper);
+        new RangeGuardVault(address(token0), address(0), owner, keeper, address(positionManager));
 
         vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.SameTokenInOut.selector, address(token0)));
-        new RangeGuardVault(address(token0), address(token0), owner, keeper);
+        new RangeGuardVault(address(token0), address(token0), owner, keeper, address(positionManager));
+
+        vm.expectRevert(RangeGuardVault.ZeroAddress.selector);
+        new RangeGuardVault(address(token0), address(token1), owner, keeper, address(0));
 
         MockERC20 tokenHighDecimals = new MockERC20("High", "HI", 19);
         vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.InvalidDecimals.selector, uint8(19)));
-        new RangeGuardVault(address(tokenHighDecimals), address(token1), owner, keeper);
+        new RangeGuardVault(address(tokenHighDecimals), address(token1), owner, keeper, address(positionManager));
     }
 
     function test_constructor_emits_initialized_event() public {
@@ -48,9 +54,12 @@ contract RangeGuardVaultTest is Test {
         address expected = vm.computeCreateAddress(address(this), nonce);
 
         vm.expectEmit(true, true, true, true, expected);
-        emit RangeGuardVault.RangeGuardVaultInitialized(address(token0), address(token1), owner, keeper);
+        emit RangeGuardVault.RangeGuardVaultInitialized(
+            address(token0), address(token1), owner, keeper, address(positionManager)
+        );
 
-        RangeGuardVault newVault = new RangeGuardVault(address(token0), address(token1), owner, keeper);
+        RangeGuardVault newVault =
+            new RangeGuardVault(address(token0), address(token1), owner, keeper, address(positionManager));
         assertEq(address(newVault), expected);
     }
 
