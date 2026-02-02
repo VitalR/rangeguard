@@ -1,66 +1,83 @@
-## Foundry
+## RangeGuard Contracts
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+Keeper-driven vault for managing a Uniswap v4 LP position with strict onchain guardrails.
 
-Foundry consists of:
+### Main contract
 
-- **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
-- **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
-- **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
-- **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+`src/RangeGuardVault.sol`
 
-## Documentation
+### Responsibilities
 
-https://book.getfoundry.sh/
+- Custody for token0 / token1
+- Stores position metadata: `{ positionId, tickLower, tickUpper, tickSpacing }`
+- Owner-managed configuration:
+  - `setKeeper`
+  - `setMaxSlippageBps`
+  - `setPositionState`
+  - `pause` / `unpause`
+  - withdrawals (ERC20 + ETH rescue)
+- Keeper-managed execution:
+  - `rebalance(RebalanceParams)`:
+    - validates new ticks align to stored spacing
+    - sets bounded approvals for the Uniswap v4 PositionManager
+    - calls `IPositionManager.modifyLiquidities(unlockData, deadline)`
+    - verifies vault owns new position tokenId
+    - updates position metadata and emits `PositionRebalanced`
 
-## Usage
+### Tests
 
-### Build
+`test/RangeGuardVaultTest.t.sol`  
+Covers constructor validations, deposit/withdraw, pause/unpause, config changes, policy hashing, tick validation, ETH rescue.
 
-```shell
-$ forge build
-```
+`test/RangeGuardVaultRebalanceTest.t.sol`  
+Covers rebalance boundary behaviors using `MockPositionManager`:
 
-### Test
+- keeper gating
+- pause gating
+- not-initialized reverts
+- tick validation and deadline reverts
+- approvals + external call observation + state update
+- new-position ownership enforcement
+- callValue forwarding + insufficient ETH guard
 
-```shell
-$ forge test
-```
+### Mocks
 
-### Format
+- `test/mocks/MockERC20.sol`: mintable token with configurable decimals
+- `test/mocks/MockPositionManager.sol`: minimal boundary mock that records:
+  - `lastCaller`
+  - `lastUnlockDataHash`
+  - `lastDeadline`
+  - `lastValue`
+  and simulates “minting” a new position to the vault.
 
-```shell
-$ forge fmt
-```
+### Commands
 
-### Gas Snapshots
-
-```shell
-$ forge snapshot
-```
-
-### Anvil
-
-```shell
-$ anvil
-```
-
-### Deploy
-
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
-```
-
-### Cast
-
-```shell
-$ cast <subcommand>
-```
-
-### Help
+Run unit tests:
 
 ```shell
-$ forge --help
-$ anvil --help
-$ cast --help
+forge test -vv
 ```
+
+Coverage:
+
+```shell
+forge coverage
+```
+
+Format:
+
+```shell
+forge fmt
+```
+
+### Notes on Uniswap v4 integration
+
+The contract integrates at the periphery interface boundary via:
+
+`IPositionManager.modifyLiquidities(bytes unlockData, uint256 deadline)`
+
+`unlockData` is produced offchain by the keeper (later milestone). Onchain logic remains minimal and guardrail-focused.
+
+### License
+
+MIT License
