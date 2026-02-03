@@ -10,7 +10,7 @@ import { MockERC20 } from "./mocks/MockERC20.sol";
 import { MockPositionManager } from "./mocks/MockPositionManager.sol";
 
 /// @title RangeGuardVaultTest
-/// @notice Unit tests for RangeGuardVault.
+/// @notice Unit tests for RangeGuardVault (owner-managed configuration & controls).
 contract RangeGuardVaultTest is Test {
     MockERC20 private token0;
     MockERC20 private token1;
@@ -47,6 +47,10 @@ contract RangeGuardVaultTest is Test {
         MockERC20 tokenHighDecimals = new MockERC20("High", "HI", 19);
         vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.InvalidDecimals.selector, uint8(19)));
         new RangeGuardVault(address(tokenHighDecimals), address(token1), owner, keeper, address(positionManager));
+
+        MockERC20 tokenHighDecimals1 = new MockERC20("High1", "HI1", 19);
+        vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.InvalidDecimals.selector, uint8(19)));
+        new RangeGuardVault(address(token0), address(tokenHighDecimals1), owner, keeper, address(positionManager));
     }
 
     function test_constructor_emits_initialized_event() public {
@@ -198,6 +202,12 @@ contract RangeGuardVaultTest is Test {
         vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.TickNotAligned.selector, int24(25), int24(10)));
         vault.setPositionState(1, -20, 25, 10);
 
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.NewPositionNotOwned.selector, uint256(42)));
+        vault.setPositionState(42, -20, 20, 10);
+
+        positionManager.mintTo(address(vault), 42);
+
         uint256 beforePolicy = vault.policyVersion();
         bytes32 beforeHash = vault.hashPolicy();
         vm.prank(owner);
@@ -285,6 +295,7 @@ contract RangeGuardVaultTest is Test {
     }
 
     function test_clear_position_state() public {
+        positionManager.mintTo(address(vault), 42);
         vm.prank(owner);
         vault.setPositionState(42, -20, 20, 10);
         assertTrue(vault.isPositionInitialized());

@@ -17,8 +17,13 @@ contract MockPositionManager {
     uint256 public requireAllowance0;
     uint256 public requireAllowance1;
     bool public revertOwnerOf;
+    uint256 public payout0;
+    uint256 public payout1;
+    bool public mintOnModify = true;
 
     mapping(uint256 => address) private _owners;
+    uint256 private _nextTokenId = 1;
+    uint256 public lastMintedTokenId;
 
     /// @notice Initialize the mock with token addresses.
     /// @param _token0 Token0 address.
@@ -48,6 +53,33 @@ contract MockPositionManager {
         revertOwnerOf = _revertOwnerOf;
     }
 
+    /// @notice Toggle minting behavior for modifyLiquidities.
+    /// @param v Whether to mint on modifyLiquidities.
+    function setMintOnModify(bool v) external {
+        mintOnModify = v;
+    }
+
+    /// @notice v4-style: ID that will be used for the next minted liquidity position.
+    function nextTokenId() external view returns (uint256) {
+        return _nextTokenId;
+    }
+
+    /// @notice Test helper: pre-mint an id to a recipient.
+    /// @param to Recipient of the token id.
+    /// @param tokenId Token id to mint.
+    function mintTo(address to, uint256 tokenId) external {
+        _owners[tokenId] = to;
+        if (tokenId >= _nextTokenId) _nextTokenId = tokenId + 1;
+    }
+
+    /// @notice Optional: simulate payouts to the caller (vault) on modifyLiquidities.
+    /// @param _payout0 Token0 payout amount.
+    /// @param _payout1 Token1 payout amount.
+    function setPayout(uint256 _payout0, uint256 _payout1) external {
+        payout0 = _payout0;
+        payout1 = _payout1;
+    }
+
     /// @notice Simulate modifyLiquidities.
     /// @param unlockData Opaque unlock data.
     /// @param deadline Deadline supplied by caller.
@@ -64,9 +96,16 @@ contract MockPositionManager {
             require(IERC20(token1).allowance(msg.sender, address(this)) >= requireAllowance1, "ALLOW1");
         }
 
-        if (expectedNewTokenId != 0) {
-            _owners[expectedNewTokenId] = msg.sender;
+        if (mintOnModify) {
+            uint256 mintedId = expectedNewTokenId != 0 ? expectedNewTokenId : _nextTokenId;
+            _owners[mintedId] = msg.sender;
+            lastMintedTokenId = mintedId;
+
+            if (mintedId >= _nextTokenId) _nextTokenId = mintedId + 1;
         }
+
+        if (payout0 > 0) IERC20(token0).transfer(msg.sender, payout0);
+        if (payout1 > 0) IERC20(token1).transfer(msg.sender, payout1);
     }
 
     /// @notice Return owner for a token id (zero if not minted).

@@ -12,8 +12,8 @@ import { IPositionManager } from "v4-periphery/src/interfaces/IPositionManager.s
 
 /// @title RangeGuardVault
 /// @notice Custody vault for token0/token1 that owns a Uniswap v4 LP position and supports keeper-triggered
-///     rebalancing.
-/// @dev The owner manages configuration and withdrawals. A keeper can execute constrained rebalances via
+///     bootstrap, collect, and rebalancing.
+/// @dev The owner manages configuration and withdrawals. A keeper can execute constrained actions via
 ///     the Uniswap v4 PositionManager using opaque `unlockData` built offchain (monitor → decide → act).
 ///     Deposits and keeper actions are pausable, and `hashPolicy()` binds the current configuration for auditability.
 contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
@@ -77,6 +77,32 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
         bytes32 unlockDataHash
     );
 
+    /// @notice Emitted after the first position is bootstrapped.
+    /// @param newPositionId New position id.
+    /// @param tickLower Lower tick.
+    /// @param tickUpper Upper tick.
+    /// @param tickSpacing Tick spacing.
+    /// @param unlockDataHash Hash of the unlockData payload.
+    event PositionBootstrapped(
+        uint256 indexed newPositionId, int24 tickLower, int24 tickUpper, int24 tickSpacing, bytes32 unlockDataHash
+    );
+
+    /// @notice Emitted after fees are collected via PositionManager.
+    /// @param positionId Position id used for collection.
+    /// @param balance0Before Token0 balance before the call.
+    /// @param balance1Before Token1 balance before the call.
+    /// @param balance0After Token0 balance after the call.
+    /// @param balance1After Token1 balance after the call.
+    /// @param unlockDataHash Hash of the unlockData payload.
+    event FeesCollected(
+        uint256 indexed positionId,
+        uint256 balance0Before,
+        uint256 balance1Before,
+        uint256 balance0After,
+        uint256 balance1After,
+        bytes32 unlockDataHash
+    );
+
     /// @notice Emitted when the vault is initialized.
     /// @param token0 Token0 address.
     /// @param token1 Token1 address.
@@ -132,6 +158,9 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Thrown when a rebalance is attempted before position initialization.
     error PositionNotInitialized();
 
+    /// @notice Thrown when trying to bootstrap an already initialized position.
+    error PositionAlreadyInitialized();
+
     /// @notice Thrown when the rebalance deadline has passed.
     /// @param nowTs Current block timestamp.
     /// @param deadline Rebalance deadline.
@@ -168,6 +197,27 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 maxApprove0;
         uint256 maxApprove1;
         uint256 callValue;
+    }
+
+    /// @notice Parameters for keeper-driven initial position creation.
+    struct BootstrapParams {
+        int24 tickLower;
+        int24 tickUpper;
+        int24 tickSpacing;
+        uint256 deadline;
+        bytes unlockData;
+        uint256 maxApprove0;
+        uint256 maxApprove1;
+        uint256 callValue;
+    }
+
+    /// @notice Parameters for keeper-driven fee collection.
+    struct CollectParams {
+        uint256 deadline;
+        bytes unlockData;
+        uint256 callValue;
+        uint256 maxApprove0;
+        uint256 maxApprove1;
     }
 
     /// @notice Token0 held by the vault.
@@ -232,17 +282,6 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Accept ETH transfers for future use.
     receive() external payable { }
 
-    /// @notice Withdraw ETH from the vault to a recipient.
-    /// @param _amount Amount of ETH to withdraw.
-    /// @param _to Recipient of the withdrawal.
-    function withdrawETH(uint256 _amount, address _to) external onlyOwner nonReentrant {
-        require(_to != address(0), ZeroAddress());
-        require(_amount > 0, ZeroAmount());
-        (bool ok,) = _to.call{ value: _amount }("");
-        if (!ok) revert EthTransferFailed();
-        emit EthWithdrawn(_to, _amount);
-    }
-
     // =============================================================
     //                   DEPOSIT & WITHDRAWAL LOGIC
     // =============================================================
@@ -271,9 +310,73 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
         emit AssetWithdrawn(_asset, _to, _amount);
     }
 
+    /// @notice Withdraw ETH from the vault to a recipient.
+    /// @param _amount Amount of ETH to withdraw.
+    /// @param _to Recipient of the withdrawal.
+    function withdrawETH(uint256 _amount, address _to) external onlyOwner nonReentrant {
+        require(_to != address(0), ZeroAddress());
+        require(_amount > 0, ZeroAmount());
+        (bool ok,) = _to.call{ value: _amount }("");
+        if (!ok) revert EthTransferFailed();
+        emit EthWithdrawn(_to, _amount);
+    }
+
     // =============================================================
-    //                   KEEPER REBALANCE LOGIC
+    //                   KEEPER ACTIONS LOGIC
     // =============================================================
+
+    /// @notice Bootstrap the initial position via Uniswap v4 PositionManager.
+    /// @param _p Bootstrap parameters built by the keeper.
+    function bootstrapPosition(BootstrapParams calldata _p) external onlyKeeper whenNotPaused nonReentrant {
+        require(!position.initialized, PositionAlreadyInitialized());
+        if (block.timestamp > _p.deadline) revert DeadlineExpired(block.timestamp, _p.deadline);
+
+        _validateTicks(_p.tickLower, _p.tickUpper, _p.tickSpacing);
+
+        uint256 available = address(this).balance;
+        if (_p.callValue > available) revert InsufficientETH(available, _p.callValue);
+
+        uint256 expectedId = _nextTokenId();
+        _applyApprovals(_p.maxApprove0, _p.maxApprove1);
+
+        IPositionManager(positionManager).modifyLiquidities{ value: _p.callValue }(_p.unlockData, _p.deadline);
+
+        require(_ownsPosition(expectedId), NewPositionNotOwned(expectedId));
+
+        position = PositionState({
+            initialized: true,
+            positionId: expectedId,
+            tickLower: _p.tickLower,
+            tickUpper: _p.tickUpper,
+            tickSpacing: _p.tickSpacing
+        });
+
+        emit PositionStateUpdated(expectedId, _p.tickLower, _p.tickUpper, _p.tickSpacing);
+        emit PositionBootstrapped(expectedId, _p.tickLower, _p.tickUpper, _p.tickSpacing, keccak256(_p.unlockData));
+    }
+
+    /// @notice Collect fees/deltas via Uniswap v4 PositionManager.
+    /// @param _p Collect parameters built by the keeper.
+    function collect(CollectParams calldata _p) external onlyKeeper whenNotPaused nonReentrant {
+        require(position.initialized, PositionNotInitialized());
+        if (block.timestamp > _p.deadline) revert DeadlineExpired(block.timestamp, _p.deadline);
+
+        uint256 available = address(this).balance;
+        if (_p.callValue > available) revert InsufficientETH(available, _p.callValue);
+
+        uint256 balance0Before = IERC20(address(token0)).balanceOf(address(this));
+        uint256 balance1Before = IERC20(address(token1)).balanceOf(address(this));
+
+        _applyApprovals(_p.maxApprove0, _p.maxApprove1);
+        IPositionManager(positionManager).modifyLiquidities{ value: _p.callValue }(_p.unlockData, _p.deadline);
+
+        uint256 balance0After = IERC20(address(token0)).balanceOf(address(this));
+        uint256 balance1After = IERC20(address(token1)).balanceOf(address(this));
+
+        emit FeesCollected(
+            position.positionId, balance0Before, balance1Before, balance0After, balance1After, keccak256(_p.unlockData)
+        );
+    }
 
     /// @notice Rebalance the vault's position via Uniswap v4 PositionManager.
     /// @param _p Rebalance parameters built by the keeper.
@@ -284,45 +387,26 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
         int24 spacing = position.tickSpacing;
         _validateTicks(_p.newTickLower, _p.newTickUpper, spacing);
 
+        uint256 expectedNewId = _p.newPositionId == 0 ? _nextTokenId() : _p.newPositionId;
+
         uint256 available = address(this).balance;
         if (_p.callValue > available) revert InsufficientETH(available, _p.callValue);
 
-        if (_p.maxApprove0 > 0) {
-            IERC20 token = IERC20(address(token0));
-            if (token.allowance(address(this), positionManager) != 0) {
-                token.forceApprove(positionManager, 0);
-            }
-            token.forceApprove(positionManager, _p.maxApprove0);
-        }
-
-        if (_p.maxApprove1 > 0) {
-            IERC20 token = IERC20(address(token1));
-            if (token.allowance(address(this), positionManager) != 0) {
-                token.forceApprove(positionManager, 0);
-            }
-            token.forceApprove(positionManager, _p.maxApprove1);
-        }
-
+        _applyApprovals(_p.maxApprove0, _p.maxApprove1);
         IPositionManager(positionManager).modifyLiquidities{ value: _p.callValue }(_p.unlockData, _p.deadline);
 
-        if (!_ownsPosition(_p.newPositionId)) revert NewPositionNotOwned(_p.newPositionId);
+        if (!_ownsPosition(expectedNewId)) revert NewPositionNotOwned(expectedNewId);
 
         uint256 oldPositionId = position.positionId;
         int24 oldLower = position.tickLower;
         int24 oldUpper = position.tickUpper;
 
-        position.positionId = _p.newPositionId;
+        position.positionId = expectedNewId;
         position.tickLower = _p.newTickLower;
         position.tickUpper = _p.newTickUpper;
 
         emit PositionRebalanced(
-            oldPositionId,
-            _p.newPositionId,
-            oldLower,
-            oldUpper,
-            _p.newTickLower,
-            _p.newTickUpper,
-            keccak256(_p.unlockData)
+            oldPositionId, expectedNewId, oldLower, oldUpper, _p.newTickLower, _p.newTickUpper, keccak256(_p.unlockData)
         );
     }
 
@@ -358,6 +442,7 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
         onlyOwner
     {
         _validateTicks(_tickLower, _tickUpper, _tickSpacing);
+        require(_ownsPosition(_positionId), NewPositionNotOwned(_positionId));
         position = PositionState({
             initialized: true,
             positionId: _positionId,
@@ -458,6 +543,32 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
     /// @param _asset Asset address.
     function _isAllowedAsset(address _asset) internal view returns (bool) {
         return _asset == address(token0) || _asset == address(token1);
+    }
+
+    /// @notice Apply bounded approvals to the PositionManager.
+    /// @param maxApprove0 Token0 approval amount (0 to skip).
+    /// @param maxApprove1 Token1 approval amount (0 to skip).
+    function _applyApprovals(uint256 maxApprove0, uint256 maxApprove1) internal {
+        if (maxApprove0 > 0) {
+            IERC20 token = IERC20(address(token0));
+            if (token.allowance(address(this), positionManager) != 0) {
+                token.forceApprove(positionManager, 0);
+            }
+            token.forceApprove(positionManager, maxApprove0);
+        }
+
+        if (maxApprove1 > 0) {
+            IERC20 token = IERC20(address(token1));
+            if (token.allowance(address(this), positionManager) != 0) {
+                token.forceApprove(positionManager, 0);
+            }
+            token.forceApprove(positionManager, maxApprove1);
+        }
+    }
+
+    /// @notice Return the next PositionManager token id.
+    function _nextTokenId() internal view returns (uint256) {
+        return IPositionManager(positionManager).nextTokenId();
     }
 
     /// @notice Returns true if the vault owns a position.
