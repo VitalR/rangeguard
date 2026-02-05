@@ -9,6 +9,7 @@ import { IERC721 } from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 import { IPositionManager } from "v4-periphery/src/interfaces/IPositionManager.sol";
+import { IPermit2 } from "./interfaces/IPermit2.sol";
 
 /// @title RangeGuardVault
 /// @notice Custody vault for token0/token1 that owns a Uniswap v4 LP position and supports keeper-triggered
@@ -86,6 +87,12 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
     event PositionBootstrapped(
         uint256 indexed newPositionId, int24 tickLower, int24 tickUpper, int24 tickSpacing, bytes32 unlockDataHash
     );
+
+    /// @notice Emitted when Permit2 allowance is set for a token.
+    /// @param token Token approved via Permit2.
+    /// @param amount Allowance amount set.
+    /// @param expiration Expiration timestamp for the allowance.
+    event Permit2AllowanceSet(address indexed token, uint256 amount, uint48 expiration);
 
     /// @notice Emitted after fees are collected via PositionManager.
     /// @param positionId Position id used for collection.
@@ -174,6 +181,14 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
     /// @param required ETH required for the call.
     error InsufficientETH(uint256 available, uint256 required);
 
+    /// @notice Thrown when a Permit2 amount does not fit into uint160.
+    /// @param amount Amount provided.
+    error Permit2AmountTooLarge(uint256 amount);
+
+    /// @notice Thrown when Permit2 expiration does not fit into uint48.
+    /// @param expiration Expiration timestamp provided.
+    error Permit2ExpirationTooLarge(uint256 expiration);
+
     // =============================================================
     //                 DATA STRUCTS & STORAGE
     // =============================================================
@@ -230,6 +245,8 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
     uint8 public immutable token1Decimals;
     /// @notice Uniswap v4 PositionManager address.
     address public immutable positionManager;
+    /// @notice Permit2 contract address used by PositionManager.
+    address public constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
     /// @notice Keeper address authorized for keeper-only actions.
     address public keeper;
@@ -338,6 +355,7 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
 
         uint256 expectedId = _nextTokenId();
         _applyApprovals(_p.maxApprove0, _p.maxApprove1);
+        _applyPermit2Allowances(_p.maxApprove0, _p.maxApprove1, _p.deadline);
 
         IPositionManager(positionManager).modifyLiquidities{ value: _p.callValue }(_p.unlockData, _p.deadline);
 
@@ -368,6 +386,7 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 balance1Before = IERC20(address(token1)).balanceOf(address(this));
 
         _applyApprovals(_p.maxApprove0, _p.maxApprove1);
+        _applyPermit2Allowances(_p.maxApprove0, _p.maxApprove1, _p.deadline);
         IPositionManager(positionManager).modifyLiquidities{ value: _p.callValue }(_p.unlockData, _p.deadline);
 
         uint256 balance0After = IERC20(address(token0)).balanceOf(address(this));
@@ -393,6 +412,7 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
         if (_p.callValue > available) revert InsufficientETH(available, _p.callValue);
 
         _applyApprovals(_p.maxApprove0, _p.maxApprove1);
+        _applyPermit2Allowances(_p.maxApprove0, _p.maxApprove1, _p.deadline);
         IPositionManager(positionManager).modifyLiquidities{ value: _p.callValue }(_p.unlockData, _p.deadline);
 
         if (!_ownsPosition(expectedNewId)) revert NewPositionNotOwned(expectedNewId);
@@ -564,6 +584,35 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
             }
             token.forceApprove(positionManager, maxApprove1);
         }
+    }
+
+    /// @notice Apply Permit2 allowances so PositionManager can pull tokens via Permit2.
+    /// @param maxApprove0 Token0 approval amount (0 to skip).
+    /// @param maxApprove1 Token1 approval amount (0 to skip).
+    /// @param deadline Transaction deadline used to bound Permit2 expiration.
+    function _applyPermit2Allowances(uint256 maxApprove0, uint256 maxApprove1, uint256 deadline) internal {
+        uint256 expiration = deadline + 600;
+        if (expiration > type(uint48).max) revert Permit2ExpirationTooLarge(expiration);
+        uint48 permitExpiration = uint48(expiration);
+
+        if (maxApprove0 > 0) {
+            _applyPermit2Allowance(IERC20(address(token0)), maxApprove0, permitExpiration);
+        }
+        if (maxApprove1 > 0) {
+            _applyPermit2Allowance(IERC20(address(token1)), maxApprove1, permitExpiration);
+        }
+    }
+
+    function _applyPermit2Allowance(IERC20 token, uint256 amount, uint48 expiration) internal {
+        if (amount > type(uint160).max) revert Permit2AmountTooLarge(amount);
+
+        if (token.allowance(address(this), PERMIT2) != 0) {
+            token.forceApprove(PERMIT2, 0);
+        }
+        token.forceApprove(PERMIT2, amount);
+
+        IPermit2(PERMIT2).approve(address(token), positionManager, uint160(amount), expiration);
+        emit Permit2AllowanceSet(address(token), amount, expiration);
     }
 
     /// @notice Return the next PositionManager token id.

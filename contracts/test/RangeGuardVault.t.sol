@@ -7,6 +7,7 @@ import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 
 import { RangeGuardVault } from "../src/RangeGuardVault.sol";
 import { MockERC20 } from "./mocks/MockERC20.sol";
+import { MockPermit2 } from "./mocks/MockPermit2.sol";
 import { MockPositionManager } from "./mocks/MockPositionManager.sol";
 
 /// @title RangeGuardVaultTest
@@ -15,6 +16,7 @@ contract RangeGuardVaultTest is Test {
     MockERC20 private token0;
     MockERC20 private token1;
     MockERC20 private tokenBad;
+    MockPermit2 private permit2;
     MockPositionManager private positionManager;
     RangeGuardVault private vault;
 
@@ -22,12 +24,17 @@ contract RangeGuardVaultTest is Test {
     address private keeper = address(0xBEEF);
     address private user = address(0xCAFE);
     address private recipient = address(0xD00D);
+    address private constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
     function setUp() public {
         token0 = new MockERC20("Token0", "TK0", 6);
         token1 = new MockERC20("Token1", "TK1", 18);
         tokenBad = new MockERC20("Bad", "BAD", 18);
-        positionManager = new MockPositionManager(address(token0), address(token1));
+        MockPermit2 permit2Impl = new MockPermit2();
+        vm.etch(PERMIT2, address(permit2Impl).code);
+        permit2 = MockPermit2(PERMIT2);
+
+        positionManager = new MockPositionManager(address(token0), address(token1), PERMIT2);
         vault = new RangeGuardVault(address(token0), address(token1), owner, keeper, address(positionManager));
     }
 

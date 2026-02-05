@@ -7,6 +7,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { RangeGuardVault } from "../src/RangeGuardVault.sol";
 import { MockERC20 } from "./mocks/MockERC20.sol";
+import { MockPermit2 } from "./mocks/MockPermit2.sol";
 import { MockPositionManager } from "./mocks/MockPositionManager.sol";
 
 /// @title RangeGuardVaultKeeperTest
@@ -14,17 +15,23 @@ import { MockPositionManager } from "./mocks/MockPositionManager.sol";
 contract RangeGuardVaultKeeperTest is Test {
     MockERC20 private token0;
     MockERC20 private token1;
+    MockPermit2 private permit2;
     MockPositionManager private positionManager;
     RangeGuardVault private vault;
 
     address private owner = address(0xA11CE);
     address private keeper = address(0xBEEF);
     address private user = address(0xCAFE);
+    address private constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
     function setUp() public {
         token0 = new MockERC20("Token0", "TK0", 6);
         token1 = new MockERC20("Token1", "TK1", 18);
-        positionManager = new MockPositionManager(address(token0), address(token1));
+        MockPermit2 permit2Impl = new MockPermit2();
+        vm.etch(PERMIT2, address(permit2Impl).code);
+        permit2 = MockPermit2(PERMIT2);
+
+        positionManager = new MockPositionManager(address(token0), address(token1), PERMIT2);
         vault = new RangeGuardVault(address(token0), address(token1), owner, keeper, address(positionManager));
 
         token0.mint(address(vault), 1_000_000);
@@ -108,6 +115,15 @@ contract RangeGuardVaultKeeperTest is Test {
         assertEq(IERC20(address(token0)).allowance(address(vault), address(positionManager)), 500);
         assertEq(IERC20(address(token1)).allowance(address(vault), address(positionManager)), 700);
 
+        (uint160 amount0, uint48 expiration0,) =
+            permit2.allowance(address(vault), address(token0), address(positionManager));
+        (uint160 amount1, uint48 expiration1,) =
+            permit2.allowance(address(vault), address(token1), address(positionManager));
+        assertEq(uint256(amount0), 500);
+        assertEq(uint256(amount1), 700);
+        assertGt(expiration0, block.timestamp);
+        assertGt(expiration1, block.timestamp);
+
         (int24 lower, int24 upper, int24 spacing, uint256 positionId) = vault.ticks();
         assertEq(positionId, 42);
         assertEq(lower, -10);
@@ -134,6 +150,15 @@ contract RangeGuardVaultKeeperTest is Test {
 
         assertEq(IERC20(address(token0)).allowance(address(vault), address(positionManager)), 10);
         assertEq(IERC20(address(token1)).allowance(address(vault), address(positionManager)), 20);
+
+        (uint160 amount0, uint48 expiration0,) =
+            permit2.allowance(address(vault), address(token0), address(positionManager));
+        (uint160 amount1, uint48 expiration1,) =
+            permit2.allowance(address(vault), address(token1), address(positionManager));
+        assertEq(uint256(amount0), 10);
+        assertEq(uint256(amount1), 20);
+        assertGt(expiration0, block.timestamp);
+        assertGt(expiration1, block.timestamp);
     }
 
     function test_rebalance_reverts_when_new_position_not_owned() public {
@@ -270,6 +295,34 @@ contract RangeGuardVaultKeeperTest is Test {
 
         assertEq(IERC20(address(token0)).allowance(address(vault), address(positionManager)), 10);
         assertEq(IERC20(address(token1)).allowance(address(vault), address(positionManager)), 20);
+
+        (uint160 amount0, uint48 expiration0,) =
+            permit2.allowance(address(vault), address(token0), address(positionManager));
+        (uint160 amount1, uint48 expiration1,) =
+            permit2.allowance(address(vault), address(token1), address(positionManager));
+        assertEq(uint256(amount0), 10);
+        assertEq(uint256(amount1), 20);
+        assertGt(expiration0, block.timestamp);
+        assertGt(expiration1, block.timestamp);
+    }
+
+    function test_bootstrap_resets_permit2_allowance_before_approve() public {
+        positionManager.setRequiredAllowances(10, 20);
+
+        vm.prank(address(vault));
+        IERC20(address(token0)).approve(PERMIT2, 1);
+        vm.prank(address(vault));
+        IERC20(address(token1)).approve(PERMIT2, 1);
+
+        RangeGuardVault.BootstrapParams memory p = _bootstrapParams();
+        p.maxApprove0 = 10;
+        p.maxApprove1 = 20;
+
+        vm.prank(keeper);
+        vault.bootstrapPosition(p);
+
+        assertEq(IERC20(address(token0)).allowance(address(vault), PERMIT2), 10);
+        assertEq(IERC20(address(token1)).allowance(address(vault), PERMIT2), 20);
     }
 
     function test_bootstrap_initializes_position_and_emits() public {
@@ -305,6 +358,29 @@ contract RangeGuardVaultKeeperTest is Test {
         vm.expectRevert(RangeGuardVault.PositionAlreadyInitialized.selector);
         vm.prank(keeper);
         vault.bootstrapPosition(_bootstrapParams());
+    }
+
+    function test_bootstrap_reverts_when_permit2_amount_too_large() public {
+        RangeGuardVault.BootstrapParams memory p = _bootstrapParams();
+        p.maxApprove0 = uint256(type(uint160).max) + 1;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(RangeGuardVault.Permit2AmountTooLarge.selector, uint256(type(uint160).max) + 1)
+        );
+        vm.prank(keeper);
+        vault.bootstrapPosition(p);
+    }
+
+    function test_bootstrap_reverts_when_permit2_expiration_too_large() public {
+        RangeGuardVault.BootstrapParams memory p = _bootstrapParams();
+        p.maxApprove0 = 1;
+        p.deadline = type(uint48).max;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(RangeGuardVault.Permit2ExpirationTooLarge.selector, uint256(type(uint48).max) + 600)
+        );
+        vm.prank(keeper);
+        vault.bootstrapPosition(p);
     }
 
     //--------------------------------Collect tests--------------------------------
@@ -351,6 +427,15 @@ contract RangeGuardVaultKeeperTest is Test {
 
         assertEq(IERC20(address(token0)).allowance(address(vault), address(positionManager)), 10);
         assertEq(IERC20(address(token1)).allowance(address(vault), address(positionManager)), 20);
+
+        (uint160 amount0, uint48 expiration0,) =
+            permit2.allowance(address(vault), address(token0), address(positionManager));
+        (uint160 amount1, uint48 expiration1,) =
+            permit2.allowance(address(vault), address(token1), address(positionManager));
+        assertEq(uint256(amount0), 10);
+        assertEq(uint256(amount1), 20);
+        assertGt(expiration0, block.timestamp);
+        assertGt(expiration1, block.timestamp);
     }
 
     function test_collect_reverts_when_not_initialized() public {

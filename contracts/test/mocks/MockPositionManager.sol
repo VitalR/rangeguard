@@ -5,7 +5,16 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title MockPositionManager
 /// @notice Minimal mock for Uniswap v4 PositionManager boundary tests.
+interface IPermit2 {
+    function allowance(address owner, address token, address spender)
+        external
+        view
+        returns (uint160 amount, uint48 expiration, uint48 nonce);
+}
+
 contract MockPositionManager {
+    error AllowanceExpired(uint256 deadline);
+
     bytes32 public lastUnlockDataHash;
     uint256 public lastDeadline;
     uint256 public lastValue;
@@ -14,6 +23,7 @@ contract MockPositionManager {
 
     address public token0;
     address public token1;
+    address public permit2;
     uint256 public requireAllowance0;
     uint256 public requireAllowance1;
     bool public revertOwnerOf;
@@ -25,12 +35,14 @@ contract MockPositionManager {
     uint256 private _nextTokenId = 1;
     uint256 public lastMintedTokenId;
 
-    /// @notice Initialize the mock with token addresses.
+    /// @notice Initialize the mock with token and Permit2 addresses.
     /// @param _token0 Token0 address.
     /// @param _token1 Token1 address.
-    constructor(address _token0, address _token1) {
+    /// @param _permit2 Permit2 address.
+    constructor(address _token0, address _token1, address _permit2) {
         token0 = _token0;
         token1 = _token1;
+        permit2 = _permit2;
     }
 
     /// @notice Set the token id to mint to the caller on modifyLiquidities.
@@ -91,9 +103,17 @@ contract MockPositionManager {
 
         if (requireAllowance0 > 0) {
             require(IERC20(token0).allowance(msg.sender, address(this)) >= requireAllowance0, "ALLOW0");
+            (uint160 amount, uint48 expiration,) = IPermit2(permit2).allowance(msg.sender, token0, address(this));
+            if (expiration <= block.timestamp || amount < requireAllowance0) {
+                revert AllowanceExpired(expiration);
+            }
         }
         if (requireAllowance1 > 0) {
             require(IERC20(token1).allowance(msg.sender, address(this)) >= requireAllowance1, "ALLOW1");
+            (uint160 amount, uint48 expiration,) = IPermit2(permit2).allowance(msg.sender, token1, address(this));
+            if (expiration <= block.timestamp || amount < requireAllowance1) {
+                revert AllowanceExpired(expiration);
+            }
         }
 
         if (mintOnModify) {

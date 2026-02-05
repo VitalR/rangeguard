@@ -51,4 +51,4 @@ forge script script/DeployRangeGuardVault.s.sol:DeployRangeGuardVault \
 ```
 */
 
-// RangeGuardVault 0x880154CCa9C3fddA472250B16a1DF8118E3c0960
+// RangeGuardVault 0x7E866b7D7E6Eb20C555b0ec0E1706885e8742Bb4
