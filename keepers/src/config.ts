@@ -1,4 +1,5 @@
 import dotenv from "dotenv";
+import { getAddress } from "viem";
 import { z } from "zod";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -36,6 +37,13 @@ const parseNumber = (value: string | undefined, fallback: number): number => {
   return parsed;
 };
 
+const normalizeAddress = (value: string | undefined): string | undefined => {
+  if (!value) {
+    return undefined;
+  }
+  return getAddress(value);
+};
+
 const optionalAddress = z.union([z.string().regex(addressRegex), z.literal("")]).optional();
 const optionalBytes32 = z.union([z.string().regex(/^0x[0-9a-fA-F]{64}$/), z.literal("")]).optional();
 
@@ -43,8 +51,12 @@ const envSchema = z.object({
   RPC_URL: z.string().min(1, "RPC_URL is required"),
   KEEPER_PRIVATE_KEY: z.string().regex(/^0x[0-9a-fA-F]{64}$/, "KEEPER_PRIVATE_KEY must be 0x + 64 hex chars"),
   VAULT_ADDRESS: z.string().regex(addressRegex, "VAULT_ADDRESS must be a 20-byte hex address"),
+  TOKEN0: optionalAddress,
+  TOKEN1: optionalAddress,
   STATE_VIEW_ADDRESS: z.string().regex(addressRegex, "STATE_VIEW_ADDRESS must be a 20-byte hex address"),
   POSITION_MANAGER_ADDRESS: optionalAddress,
+  POOL_MANAGER_ADDRESS: optionalAddress,
+  QUOTER_ADDRESS: optionalAddress,
   CHAIN_ID: z.string().optional(),
   DRY_RUN: z.string().optional(),
   DEFAULT_DEADLINE_SECONDS: z.string().optional(),
@@ -120,17 +132,28 @@ export const loadConfig = async (): Promise<KeeperConfig> => {
     logger.warn("DRY_RUN=false is set; use --send to broadcast transactions.");
   }
 
-  const positionManagerAddress =
-    env.POSITION_MANAGER_ADDRESS && env.POSITION_MANAGER_ADDRESS !== "" ? env.POSITION_MANAGER_ADDRESS : undefined;
+  const positionManagerAddress = normalizeAddress(
+    env.POSITION_MANAGER_ADDRESS && env.POSITION_MANAGER_ADDRESS !== "" ? env.POSITION_MANAGER_ADDRESS : undefined
+  );
+  const poolManagerAddress = normalizeAddress(
+    env.POOL_MANAGER_ADDRESS && env.POOL_MANAGER_ADDRESS !== "" ? env.POOL_MANAGER_ADDRESS : undefined
+  );
+  const quoterAddress = normalizeAddress(env.QUOTER_ADDRESS && env.QUOTER_ADDRESS !== "" ? env.QUOTER_ADDRESS : undefined);
+  const token0 = normalizeAddress(env.TOKEN0 && env.TOKEN0 !== "" ? env.TOKEN0 : undefined);
+  const token1 = normalizeAddress(env.TOKEN1 && env.TOKEN1 !== "" ? env.TOKEN1 : undefined);
   const poolId = env.POOL_ID && env.POOL_ID !== "" ? env.POOL_ID : undefined;
   const poolHooks = env.POOL_HOOKS && env.POOL_HOOKS !== "" ? env.POOL_HOOKS : undefined;
 
   return {
     rpcUrl: env.RPC_URL,
     keeperPrivateKey: env.KEEPER_PRIVATE_KEY as KeeperConfig["keeperPrivateKey"],
-    vaultAddress: env.VAULT_ADDRESS as KeeperConfig["vaultAddress"],
-    stateViewAddress: env.STATE_VIEW_ADDRESS as KeeperConfig["stateViewAddress"],
+    vaultAddress: getAddress(env.VAULT_ADDRESS) as KeeperConfig["vaultAddress"],
+    stateViewAddress: getAddress(env.STATE_VIEW_ADDRESS) as KeeperConfig["stateViewAddress"],
     positionManagerAddress: positionManagerAddress as KeeperConfig["positionManagerAddress"],
+    poolManagerAddress: poolManagerAddress as KeeperConfig["poolManagerAddress"],
+    quoterAddress: quoterAddress as KeeperConfig["quoterAddress"],
+    token0: token0 as KeeperConfig["token0"],
+    token1: token1 as KeeperConfig["token1"],
     chainId: parseNumber(env.CHAIN_ID, 11155111),
     dryRun: parseBoolean(env.DRY_RUN, true),
     defaultDeadlineSeconds: parseNumber(env.DEFAULT_DEADLINE_SECONDS, 180),

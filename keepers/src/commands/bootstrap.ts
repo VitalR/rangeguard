@@ -4,7 +4,7 @@ import { createClients } from "../clients";
 import { loadConfig } from "../config";
 import { rangeGuardVaultAbi } from "../abi/RangeGuardVault";
 import { buildPoolKey, buildPoolFromState } from "../uniswap/pool";
-import { centerRange } from "../uniswap/ticks";
+import { computeRangeTicks } from "../uniswap/ticks";
 import { buildPositionFromAmounts, slippagePercent } from "../uniswap/position";
 import { buildBootstrapUnlockData } from "../uniswap/planner";
 import { logger } from "../logger";
@@ -77,9 +77,11 @@ export const bootstrapCommand = async (options: BootstrapOptions) => {
       throw new KeeperError("Vault position already initialized");
     }
 
-    if (keeper.toLowerCase() !== account.address.toLowerCase()) {
-      logger.warn("Vault keeper does not match configured key", { keeper, configured: account.address });
-    }
+    invariant(
+      keeper.toLowerCase() === account.address.toLowerCase(),
+      "Vault keeper does not match configured key",
+      { keeper, configured: account.address }
+    );
 
     if (config.policy.maxSlippageBps > Number(maxSlippageBps)) {
       throw new KeeperError("policy.maxSlippageBps exceeds vault maxSlippageBps");
@@ -111,7 +113,7 @@ export const bootstrapCommand = async (options: BootstrapOptions) => {
       config.poolId
     );
 
-    const { lower, upper } = centerRange(tickCurrent, config.policy.widthTicks, tickSpacing);
+    const { lower, upper } = computeRangeTicks(tickCurrent, tickSpacing, config.policy.widthTicks);
 
     await assertCooldown(config.policy, config.vaultAddress, "bootstrap");
 
@@ -193,9 +195,22 @@ export const bootstrapCommand = async (options: BootstrapOptions) => {
     })) as bigint;
 
     const dryRun = !options.send;
+    const unlockDataLength = (unlockData.length - 2) / 2;
     logger.info(dryRun ? "Dry run: bootstrap" : "Sending bootstrap", {
       expectedTokenId: expectedTokenId.toString(),
+      currentTick: tickCurrent,
+      tickLower: lower,
+      tickUpper: upper,
+      tickSpacing,
+      alignedLower: lower % tickSpacing === 0,
+      alignedUpper: upper % tickSpacing === 0,
+      amount0,
+      amount1,
+      maxApprove0: amount0Max,
+      maxApprove1: amount1Max,
+      callValue: 0n,
       unlockDataHash: keccak256(unlockData),
+      unlockDataLength,
       params
     });
 

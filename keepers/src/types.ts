@@ -18,6 +18,10 @@ export interface KeeperConfig {
   vaultAddress: Address;
   stateViewAddress: Address;
   positionManagerAddress?: Address;
+  poolManagerAddress?: Address;
+  quoterAddress?: Address;
+  token0?: Address;
+  token1?: Address;
   chainId: number;
   dryRun: boolean;
   defaultDeadlineSeconds: number;

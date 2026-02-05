@@ -83,9 +83,11 @@ export const rebalanceCommand = async (options: RebalanceOptions) => {
       throw new KeeperError("Vault position not initialized");
     }
 
-    if (keeper.toLowerCase() !== account.address.toLowerCase()) {
-      logger.warn("Vault keeper does not match configured key", { keeper, configured: account.address });
-    }
+    invariant(
+      keeper.toLowerCase() === account.address.toLowerCase(),
+      "Vault keeper does not match configured key",
+      { keeper, configured: account.address }
+    );
 
     if (config.policy.maxSlippageBps > Number(maxSlippageBps)) {
       throw new KeeperError("policy.maxSlippageBps exceeds vault maxSlippageBps");

@@ -70,9 +70,11 @@ export const collectCommand = async (options: CollectOptions) => {
       throw new KeeperError("Vault position not initialized");
     }
 
-    if (keeper.toLowerCase() !== account.address.toLowerCase()) {
-      logger.warn("Vault keeper does not match configured key", { keeper, configured: account.address });
-    }
+    invariant(
+      keeper.toLowerCase() === account.address.toLowerCase(),
+      "Vault keeper does not match configured key",
+      { keeper, configured: account.address }
+    );
 
     const positionId = ticks[3] as bigint;
     const positionManagerAddress = config.positionManagerAddress ?? positionManager;

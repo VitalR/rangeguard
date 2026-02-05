@@ -4,6 +4,7 @@ import { statusCommand } from "./commands/status";
 import { bootstrapCommand } from "./commands/bootstrap";
 import { collectCommand } from "./commands/collect";
 import { rebalanceCommand } from "./commands/rebalance";
+import { doctorCommand } from "./commands/doctor";
 import { logger } from "./logger";
 import { formatError } from "./utils/errors";
 
@@ -19,6 +20,13 @@ program
   .description("Show vault position status")
   .action(async () => {
     await statusCommand();
+  });
+
+program
+  .command("doctor")
+  .description("Verify config and vault state")
+  .action(async () => {
+    await doctorCommand();
   });
 
 program

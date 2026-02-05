@@ -9,7 +9,7 @@ export const alignDown = (tick: number, spacing: number): number => {
 
 export const isAligned = (tick: number, spacing: number): boolean => tick % spacing === 0;
 
-export const centerRange = (tick: number, widthTicks: number, spacing: number) => {
+export const computeRangeTicks = (tick: number, spacing: number, widthTicks: number) => {
   if (widthTicks <= 0) {
     throw new KeeperError("widthTicks must be positive");
   }
@@ -27,3 +27,6 @@ export const centerRange = (tick: number, widthTicks: number, spacing: number) =
   }
   return { lower, upper };
 };
+
+export const centerRange = (tick: number, widthTicks: number, spacing: number) =>
+  computeRangeTicks(tick, spacing, widthTicks);
