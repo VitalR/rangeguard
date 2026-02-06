@@ -5,6 +5,7 @@ import { loadConfig } from "../config";
 import { rangeGuardVaultAbi } from "../abi/RangeGuardVault";
 import { getPoolKeyFromPosition, buildPoolFromState } from "../uniswap/pool";
 import { buildCollectUnlockData } from "../uniswap/planner";
+import { checkPermit2Allowances } from "../uniswap/permit2";
 import { logger } from "../logger";
 import { deadlineFromNow } from "../utils/time";
 import { formatError, invariant, KeeperError } from "../utils/errors";
@@ -109,6 +110,17 @@ export const collectCommand = async (options: CollectOptions) => {
       maxApprove1: 0n
     };
 
+    await checkPermit2Allowances({
+      publicClient,
+      vault: config.vaultAddress,
+      positionManager: positionManagerAddress,
+      token0,
+      token1,
+      required0: 0n,
+      required1: 0n,
+      throwOnMissing: false
+    });
+
     const dryRun = !options.send;
     logger.info(dryRun ? "Dry run: collect" : "Sending collect", {
       positionId: positionId.toString(),
@@ -143,7 +155,7 @@ export const collectCommand = async (options: CollectOptions) => {
       account: account.address
     });
 
-    const hash = await walletClient.writeContract(simulation.request);
+    const hash = await walletClient.writeContract({ ...simulation.request, account });
     logger.info("Collect tx sent", { hash });
     await publicClient.waitForTransactionReceipt({ hash });
 

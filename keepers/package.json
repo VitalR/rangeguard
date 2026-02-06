@@ -11,7 +11,8 @@
     "bootstrap": "tsx src/index.ts bootstrap",
     "collect": "tsx src/index.ts collect",
     "rebalance": "tsx src/index.ts rebalance",
-    "test": "tsx src/__tests__/ticks.test.ts"
+    "quote": "tsx src/index.ts quote",
+    "test": "tsx src/__tests__/ticks.test.ts && tsx src/__tests__/quote.test.ts"
   },
   "dependencies": {
     "@uniswap/v4-sdk": "latest",

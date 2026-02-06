@@ -5,6 +5,7 @@ import { loadConfig } from "../config";
 import { erc20Abi } from "../abi/ERC20";
 import { rangeGuardVaultAbi } from "../abi/RangeGuardVault";
 import { buildPoolKey, getPoolSlot0 } from "../uniswap/pool";
+import { checkPermit2Allowances } from "../uniswap/permit2";
 import { logger } from "../logger";
 import { formatError, invariant, KeeperError } from "../utils/errors";
 
@@ -128,6 +129,16 @@ export const doctorCommand = async () => {
       }
 
       logger.info("Pool state", { poolId: poolState.poolId, tick: poolState.tickCurrent });
+      await checkPermit2Allowances({
+        publicClient,
+        vault: config.vaultAddress,
+        positionManager: config.positionManagerAddress ?? positionManager,
+        token0: config.token0,
+        token1: config.token1,
+        required0: 0n,
+        required1: 0n,
+        throwOnMissing: false
+      });
     } else {
       errors.push("Missing TOKEN0/TOKEN1/POOL_FEE/POOL_TICK_SPACING to derive poolId and read tick");
     }

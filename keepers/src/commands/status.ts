@@ -5,6 +5,7 @@ import { loadConfig } from "../config";
 import { rangeGuardVaultAbi } from "../abi/RangeGuardVault";
 import { erc20Abi } from "../abi/ERC20";
 import { getPoolKeyFromPosition, buildPoolKey, getPoolSlot0 } from "../uniswap/pool";
+import { checkPermit2Allowances } from "../uniswap/permit2";
 import { centerRange } from "../uniswap/ticks";
 import { logger } from "../logger";
 import { formatError, invariant } from "../utils/errors";
@@ -132,6 +133,17 @@ export const statusCommand = async () => {
       );
       currentTick = poolState.tickCurrent;
       poolId = poolState.poolId;
+
+      await checkPermit2Allowances({
+        publicClient,
+        vault: config.vaultAddress,
+        positionManager: positionManagerAddress,
+        token0,
+        token1,
+        required0: 0n,
+        required1: 0n,
+        throwOnMissing: false
+      });
     } else if (fee !== undefined && tickSpacing !== undefined) {
       const poolKey = buildPoolKey(token0Currency, token1Currency, fee, tickSpacing, hooks);
       const poolState = await getPoolSlot0(

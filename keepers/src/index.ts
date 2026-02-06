@@ -5,6 +5,7 @@ import { bootstrapCommand } from "./commands/bootstrap";
 import { collectCommand } from "./commands/collect";
 import { rebalanceCommand } from "./commands/rebalance";
 import { doctorCommand } from "./commands/doctor";
+import { quoteCommand } from "./commands/quote";
 import { logger } from "./logger";
 import { formatError } from "./utils/errors";
 
@@ -35,6 +36,7 @@ program
   .option("--send", "Send transaction (default is dry run)")
   .option("--amount0 <amount0>", "Amount of token0 to use if useFullBalances=false")
   .option("--amount1 <amount1>", "Amount of token1 to use if useFullBalances=false")
+  .option("--quoteBpsBuffer <bps>", "Bps buffer applied to derived token1 amount (default 200)")
   .action(async (options) => {
     await bootstrapCommand(options);
   });
@@ -55,6 +57,16 @@ program
   .option("--amount1 <amount1>", "Amount of token1 to use if useFullBalances=false")
   .action(async (options) => {
     await rebalanceCommand(options);
+  });
+
+program
+  .command("quote")
+  .description("Quote token0/token1 amounts using Quoter")
+  .option("--amount0 <amount0>", "Amount of token0 to quote into token1")
+  .option("--amount1 <amount1>", "Amount of token1 to quote into token0")
+  .option("--bufferBps <bps>", "Bps buffer applied to the quoted output (default 0)")
+  .action(async (options) => {
+    await quoteCommand(options);
   });
 
 program.parseAsync(process.argv).catch((err) => {

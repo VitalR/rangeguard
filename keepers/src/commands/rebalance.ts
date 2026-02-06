@@ -8,6 +8,7 @@ import { getPoolKeyFromPosition, buildPoolFromState } from "../uniswap/pool";
 import { centerRange } from "../uniswap/ticks";
 import { buildPositionFromAmounts, buildPositionFromLiquidity, slippagePercent } from "../uniswap/position";
 import { buildRebalanceUnlockData } from "../uniswap/planner";
+import { checkPermit2Allowances } from "../uniswap/permit2";
 import { logger } from "../logger";
 import { deadlineFromNow } from "../utils/time";
 import { formatError, invariant, KeeperError } from "../utils/errors";
@@ -215,6 +216,17 @@ export const rebalanceCommand = async (options: RebalanceOptions) => {
       callValue: 0n
     };
 
+    await checkPermit2Allowances({
+      publicClient,
+      vault: config.vaultAddress,
+      positionManager: positionManagerAddress,
+      token0,
+      token1,
+      required0: amount0Max,
+      required1: amount1Max,
+      throwOnMissing: false
+    });
+
     const dryRun = !options.send;
     logger.info(dryRun ? "Dry run: rebalance" : "Sending rebalance", {
       unlockDataHash: keccak256(unlockData),
@@ -233,7 +245,7 @@ export const rebalanceCommand = async (options: RebalanceOptions) => {
       account: account.address
     });
 
-    const hash = await walletClient.writeContract(simulation.request);
+    const hash = await walletClient.writeContract({ ...simulation.request, account });
     logger.info("Rebalance tx sent", { hash });
     await publicClient.waitForTransactionReceipt({ hash });
 

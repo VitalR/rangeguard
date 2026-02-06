@@ -32,5 +32,12 @@ export const positionManagerAbi = [
     stateMutability: "view",
     inputs: [{ name: "tokenId", type: "uint256" }],
     outputs: [{ name: "", type: "address" }]
+  },
+  {
+    type: "function",
+    name: "permit2",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "address" }]
   }
 ] as const;
