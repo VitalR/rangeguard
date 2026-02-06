@@ -1,0 +1,61 @@
+{
+  "runId": "1770381367803_9pk69x",
+  "command": "status",
+  "createdAt": "2026-02-06T12:36:07.803Z",
+  "chainId": 11155111,
+  "addresses": {
+    "vault": "0x7E866b7D7E6Eb20C555b0ec0E1706885e8742Bb4",
+    "positionManager": "0x429ba70129df741B2Ca2a85BC3A2a3328e5c09b4",
+    "poolId": "0x0c5089eb2863310ecab41eb94f2705ce37ce455a0f64a9ee627c7470b43161e8",
+    "token0": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+    "token1": "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",
+    "quoter": "0x61B3f2011A92d183C7dbaDBdA940a7555Ccf9227"
+  },
+  "tokens": {
+    "token0": {
+      "address": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+      "decimals": 6
+    },
+    "token1": {
+      "address": "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",
+      "decimals": 18
+    }
+  },
+  "policy": {
+    "widthTicks": 1200,
+    "edgeBps": 1000,
+    "cooldownSeconds": 60,
+    "maxSlippageBps": 30,
+    "rebalanceIfOutOfRange": true,
+    "rebalanceIfNearEdge": false,
+    "useFullBalances": true,
+    "hookDataHex": "0x"
+  },
+  "decision": {
+    "action": "execute",
+    "reason": "status"
+  },
+  "stateBefore": {
+    "balances": {
+      "token0": "10741287",
+      "token1": "49999999989201793",
+      "eth": "0"
+    },
+    "position": {
+      "initialized": true,
+      "positionId": "23023",
+      "lower": -60,
+      "upper": 1200,
+      "spacing": 60
+    },
+    "pool": {
+      "poolId": "0x0c5089eb2863310ecab41eb94f2705ce37ce455a0f64a9ee627c7470b43161e8",
+      "tick": 599
+    },
+    "inRange": true,
+    "outOfRange": false,
+    "nearEdge": false,
+    "healthBps": 4769
+  },
+  "warnings": []
+}

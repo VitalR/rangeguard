@@ -12,7 +12,7 @@
     "collect": "tsx src/index.ts collect",
     "rebalance": "tsx src/index.ts rebalance",
     "quote": "tsx src/index.ts quote",
-    "test": "tsx src/__tests__/ticks.test.ts && tsx src/__tests__/quote.test.ts"
+    "test": "tsx src/__tests__/ticks.test.ts && tsx src/__tests__/quote.test.ts && tsx src/__tests__/amounts.test.ts && tsx src/__tests__/report.test.ts"
   },
   "dependencies": {
     "@uniswap/v4-sdk": "latest",

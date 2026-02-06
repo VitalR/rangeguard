@@ -19,8 +19,11 @@ program
 program
   .command("status")
   .description("Show vault position status")
-  .action(async () => {
-    await statusCommand();
+  .option("--json", "Output report JSON only")
+  .option("--out <path>", "Write report to a custom path")
+  .option("--verbose", "Include verbose report fields")
+  .action(async (options) => {
+    await statusCommand(options);
   });
 
 program
@@ -36,7 +39,11 @@ program
   .option("--send", "Send transaction (default is dry run)")
   .option("--amount0 <amount0>", "Amount of token0 to use if useFullBalances=false")
   .option("--amount1 <amount1>", "Amount of token1 to use if useFullBalances=false")
-  .option("--quoteBpsBuffer <bps>", "Bps buffer applied to derived token1 amount (default 200)")
+  .option("--bufferBps <bps>", "Bps buffer applied to derived quote (default 200)")
+  .option("--maxSpendBps <bps>", "Max spend bps of vault balances (default 10000)")
+  .option("--json", "Output report JSON only")
+  .option("--out <path>", "Write report to a custom path")
+  .option("--verbose", "Include verbose report fields")
   .action(async (options) => {
     await bootstrapCommand(options);
   });
@@ -45,6 +52,9 @@ program
   .command("collect")
   .description("Collect fees from current position")
   .option("--send", "Send transaction (default is dry run)")
+  .option("--json", "Output report JSON only")
+  .option("--out <path>", "Write report to a custom path")
+  .option("--verbose", "Include verbose report fields")
   .action(async (options) => {
     await collectCommand(options);
   });
@@ -55,6 +65,13 @@ program
   .option("--send", "Send transaction (default is dry run)")
   .option("--amount0 <amount0>", "Amount of token0 to use if useFullBalances=false")
   .option("--amount1 <amount1>", "Amount of token1 to use if useFullBalances=false")
+  .option("--bufferBps <bps>", "Bps buffer applied to derived quote (default 200)")
+  .option("--maxSpendBps <bps>", "Max spend bps of vault balances (default 10000)")
+  .option("--force", "Force rebalance even if triggers are not met")
+  .option("--dryPlan", "Print plan only (no simulation)")
+  .option("--json", "Output report JSON only")
+  .option("--out <path>", "Write report to a custom path")
+  .option("--verbose", "Include verbose report fields")
   .action(async (options) => {
     await rebalanceCommand(options);
   });
@@ -65,6 +82,9 @@ program
   .option("--amount0 <amount0>", "Amount of token0 to quote into token1")
   .option("--amount1 <amount1>", "Amount of token1 to quote into token0")
   .option("--bufferBps <bps>", "Bps buffer applied to the quoted output (default 0)")
+  .option("--json", "Output report JSON only")
+  .option("--out <path>", "Write report to a custom path")
+  .option("--verbose", "Include verbose report fields")
   .action(async (options) => {
     await quoteCommand(options);
   });

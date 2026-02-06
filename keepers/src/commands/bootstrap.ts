@@ -1,8 +1,7 @@
 import { Token } from "@uniswap/sdk-core";
-import { keccak256, parseUnits, zeroAddress } from "viem";
+import { keccak256, zeroAddress } from "viem";
 import { createClients } from "../clients";
 import { loadConfig } from "../config";
-import { erc20Abi } from "../abi/ERC20";
 import { rangeGuardVaultAbi } from "../abi/RangeGuardVault";
 import { buildPoolKey, buildPoolFromState } from "../uniswap/pool";
 import { computeBootstrapTicks } from "../uniswap/ticks";
@@ -10,25 +9,30 @@ import { buildPositionFromAmounts } from "../uniswap/position";
 import { buildBootstrapUnlockData } from "../uniswap/planner";
 import { decodeUniswapError, extractRevertData, getRevertHint } from "../uniswap/errorDecoder";
 import { checkPermit2Allowances } from "../uniswap/permit2";
-import { applyBpsBuffer, formatQuotePrice, quoteExactInputSingle } from "../uniswap/quoter";
 import { logger } from "../logger";
 import { deadlineFromNow } from "../utils/time";
 import { formatError, invariant, KeeperError } from "../utils/errors";
 import { assertCooldown, recordAction } from "../policy/policy";
+import { selectAmounts } from "../amounts";
+import { createRunId, hashCalldata, outputReport, RunReport } from "../report";
+import { parseVaultEvents } from "../vault/events";
+import { fetchVaultState } from "../vault/state";
 
 type BootstrapOptions = {
   send?: boolean;
   amount0?: string;
   amount1?: string;
-  quoteBpsBuffer?: string;
+  bufferBps?: string;
+  maxSpendBps?: string;
+  json?: boolean;
+  out?: string;
+  verbose?: boolean;
 };
-
-const minBigInt = (a: bigint, b: bigint): bigint => (a < b ? a : b);
 
 const toBigInt = (value: { toString(): string } | bigint): bigint =>
   typeof value === "bigint" ? value : BigInt(value.toString());
 
-export const bootstrapCommand = async (options: BootstrapOptions) => {
+export const bootstrapCommand = async (options: BootstrapOptions = {}) => {
   try {
     const config = await loadConfig();
     const { publicClient, walletClient, account } = createClients(config);
@@ -36,59 +40,18 @@ export const bootstrapCommand = async (options: BootstrapOptions) => {
     const chainId = await publicClient.getChainId();
     invariant(chainId === config.chainId, `Chain ID mismatch: RPC=${chainId}, expected=${config.chainId}`);
 
-    const [token0, token1, token0Decimals, token1Decimals, keeper, maxSlippageBps, positionManager, initialized] =
-      await Promise.all([
-        publicClient.readContract({
-          address: config.vaultAddress,
-          abi: rangeGuardVaultAbi,
-          functionName: "token0"
-        }),
-        publicClient.readContract({
-          address: config.vaultAddress,
-          abi: rangeGuardVaultAbi,
-          functionName: "token1"
-        }),
-        publicClient.readContract({
-          address: config.vaultAddress,
-          abi: rangeGuardVaultAbi,
-          functionName: "token0Decimals"
-        }),
-        publicClient.readContract({
-          address: config.vaultAddress,
-          abi: rangeGuardVaultAbi,
-          functionName: "token1Decimals"
-        }),
-        publicClient.readContract({
-          address: config.vaultAddress,
-          abi: rangeGuardVaultAbi,
-          functionName: "keeper"
-        }),
-        publicClient.readContract({
-          address: config.vaultAddress,
-          abi: rangeGuardVaultAbi,
-          functionName: "maxSlippageBps"
-        }),
-        publicClient.readContract({
-          address: config.vaultAddress,
-          abi: rangeGuardVaultAbi,
-          functionName: "positionManager"
-        }),
-        publicClient.readContract({
-          address: config.vaultAddress,
-          abi: rangeGuardVaultAbi,
-          functionName: "isPositionInitialized"
-        })
-      ]);
+    const [{ state: stateBefore, context }, maxSlippageBps] = await Promise.all([
+      fetchVaultState(config, publicClient, account),
+      publicClient.readContract({
+        address: config.vaultAddress,
+        abi: rangeGuardVaultAbi,
+        functionName: "maxSlippageBps"
+      })
+    ]);
 
-    if (initialized) {
+    if (context.initialized) {
       throw new KeeperError("Vault position already initialized");
     }
-
-    invariant(
-      keeper.toLowerCase() === account.address.toLowerCase(),
-      "Vault keeper does not match configured key",
-      { keeper, configured: account.address }
-    );
 
     if (config.policy.maxSlippageBps > Number(maxSlippageBps)) {
       throw new KeeperError("policy.maxSlippageBps exceeds vault maxSlippageBps");
@@ -101,16 +64,16 @@ export const bootstrapCommand = async (options: BootstrapOptions) => {
       throw new KeeperError("POOL_FEE and POOL_TICK_SPACING are required for bootstrap");
     }
 
-    const token0Currency = new Token(config.chainId, token0, Number(token0Decimals));
-    const token1Currency = new Token(config.chainId, token1, Number(token1Decimals));
+    const token0Currency = new Token(config.chainId, context.token0, Number(context.token0Decimals));
+    const token1Currency = new Token(config.chainId, context.token1, Number(context.token1Decimals));
     const poolKey = buildPoolKey(token0Currency, token1Currency, fee, tickSpacing, hooks);
 
-    const { pool, tickCurrent } = await buildPoolFromState(
+    const { pool, poolId, tickCurrent } = await buildPoolFromState(
       publicClient,
       config.stateViewAddress,
       {
-        currency0: token0 as `0x${string}`,
-        currency1: token1 as `0x${string}`,
+        currency0: context.token0,
+        currency1: context.token1,
         fee: poolKey.fee,
         tickSpacing: poolKey.tickSpacing,
         hooks: poolKey.hooks as `0x${string}`
@@ -124,72 +87,26 @@ export const bootstrapCommand = async (options: BootstrapOptions) => {
 
     await assertCooldown(config.policy, config.vaultAddress, "bootstrap");
 
-    const [balance0, balance1] = await Promise.all([
-      publicClient.readContract({
-        address: token0,
-        abi: erc20Abi,
-        functionName: "balanceOf",
-        args: [config.vaultAddress]
-      }),
-      publicClient.readContract({
-        address: token1,
-        abi: erc20Abi,
-        functionName: "balanceOf",
-        args: [config.vaultAddress]
-      })
-    ]);
+    const amountSelection = await selectAmounts({
+      publicClient,
+      poolKey,
+      token0: context.token0,
+      token1: context.token1,
+      token0Decimals: context.token0Decimals,
+      token1Decimals: context.token1Decimals,
+      balance0: stateBefore.balances.token0,
+      balance1: stateBefore.balances.token1,
+      amount0Input: options.amount0,
+      amount1Input: options.amount1,
+      useFullBalances: config.policy.useFullBalances,
+      quoterAddress: config.quoterAddress,
+      hookData: config.policy.hookDataHex,
+      bufferBps: options.bufferBps ? Number(options.bufferBps) : undefined,
+      maxSpendBps: options.maxSpendBps ? Number(options.maxSpendBps) : undefined
+    });
 
-    let amount0 = balance0 as bigint;
-    let amount1 = balance1 as bigint;
-    if (!config.policy.useFullBalances) {
-      if (!options.amount0 && !options.amount1) {
-        throw new KeeperError("Provide --amount0 and/or --amount1 when useFullBalances=false");
-      }
-      if (options.amount0 && options.amount1) {
-        amount0 = parseUnits(options.amount0, Number(token0Decimals));
-        amount1 = parseUnits(options.amount1, Number(token1Decimals));
-      } else if (options.amount0) {
-        if (!config.quoterAddress) {
-          throw new KeeperError("QUOTER_ADDRESS is required to derive token1 amount");
-        }
-        amount0 = parseUnits(options.amount0, Number(token0Decimals));
-        const zeroForOne = token0.toLowerCase() === poolKey.currency0.toLowerCase();
-        const quotedAmount1 = await quoteExactInputSingle(publicClient, {
-          quoter: config.quoterAddress,
-          poolKey,
-          zeroForOne,
-          exactAmount: amount0,
-          hookData: config.policy.hookDataHex
-        });
-        const quoteBpsBuffer = options.quoteBpsBuffer ? Number(options.quoteBpsBuffer) : 200;
-        amount1 = applyBpsBuffer(quotedAmount1, quoteBpsBuffer);
-        const price = formatQuotePrice(amount0, quotedAmount1, Number(token0Decimals), Number(token1Decimals));
-        logger.info("Derived token1 amount from quote", {
-          amount0,
-          quotedAmount1,
-          amount1,
-          priceToken1PerToken0: price,
-          quoteBpsBuffer
-        });
-        if (amount1 > (balance1 as bigint)) {
-          throw new KeeperError("Vault token1 balance is below required derived amount", {
-            balance1,
-            requiredAmount1: amount1
-          });
-        }
-      } else {
-        throw new KeeperError("Provide --amount0 when --amount1 is omitted");
-      }
-    } else {
-      if (options.amount0) {
-        const override0 = parseUnits(options.amount0, Number(token0Decimals));
-        amount0 = minBigInt(amount0, override0);
-      }
-      if (options.amount1) {
-        const override1 = parseUnits(options.amount1, Number(token1Decimals));
-        amount1 = minBigInt(amount1, override1);
-      }
-    }
+    const amount0 = amountSelection.amount0;
+    const amount1 = amountSelection.amount1;
 
     if (lower <= tickCurrent && tickCurrent < upper) {
       if (amount0 <= 0n || amount1 <= 0n) {
@@ -227,13 +144,13 @@ export const bootstrapCommand = async (options: BootstrapOptions) => {
       throw new KeeperError("Unlock data is empty");
     }
 
-    const positionManagerAddress = config.positionManagerAddress ?? positionManager;
+    const positionManagerAddress = config.positionManagerAddress ?? context.positionManager;
     await checkPermit2Allowances({
       publicClient,
       vault: config.vaultAddress,
       positionManager: positionManagerAddress,
-      token0,
-      token1,
+      token0: context.token0,
+      token1: context.token1,
       required0: amount0Max,
       required1: amount1Max,
       throwOnMissing: false
@@ -267,23 +184,6 @@ export const bootstrapCommand = async (options: BootstrapOptions) => {
 
     const dryRun = !options.send;
     const unlockDataLength = (unlockData.length - 2) / 2;
-    logger.info(dryRun ? "Dry run: bootstrap" : "Sending bootstrap", {
-      expectedTokenId: expectedTokenId.toString(),
-      currentTick: tickCurrent,
-      tickLower: lower,
-      tickUpper: upper,
-      tickSpacing,
-      alignedLower: lower % tickSpacing === 0,
-      alignedUpper: upper % tickSpacing === 0,
-      amount0,
-      amount1,
-      maxApprove0: amount0Max,
-      maxApprove1: amount1Max,
-      callValue: 0n,
-      unlockDataHash: keccak256(unlockData),
-      unlockDataLength,
-      params
-    });
 
     let simulation;
     try {
@@ -310,35 +210,92 @@ export const bootstrapCommand = async (options: BootstrapOptions) => {
       throw err;
     }
 
+    let gasEstimate: bigint | undefined;
+    if (options.verbose) {
+      try {
+        gasEstimate = await publicClient.estimateContractGas(simulation.request);
+      } catch {
+        gasEstimate = undefined;
+      }
+    }
+
+    const runId = createRunId();
+    const report: RunReport = {
+      runId,
+      command: "bootstrap",
+      createdAt: new Date().toISOString(),
+      chainId,
+      addresses: {
+        vault: config.vaultAddress,
+        positionManager: positionManagerAddress,
+        poolId,
+        token0: context.token0,
+        token1: context.token1,
+        quoter: config.quoterAddress
+      },
+      tokens: {
+        token0: { address: context.token0, decimals: context.token0Decimals },
+        token1: { address: context.token1, decimals: context.token1Decimals }
+      },
+      policy: config.policy,
+      decision: { action: "execute", reason: dryRun ? "dry-run" : "send" },
+      stateBefore,
+      plan: {
+        tickLower: lower,
+        tickUpper: upper,
+        tickSpacing,
+        currentTick: tickCurrent,
+        amount0: amount0.toString(),
+        amount1: amount1.toString(),
+        bufferBps: options.bufferBps ? Number(options.bufferBps) : 200,
+        maxSpendBps: options.maxSpendBps ? Number(options.maxSpendBps) : 10_000,
+        quote: amountSelection.quote ?? null
+      },
+      warnings: amountSelection.warnings
+    };
+
+    if (options.verbose) {
+      const calldata = (simulation.request as { data?: `0x${string}` }).data;
+      report.debug = {
+        unlockDataHash: keccak256(unlockData),
+        unlockDataLength,
+        calldataHash: hashCalldata(calldata),
+        gasEstimate: gasEstimate?.toString()
+      };
+    }
+
     if (dryRun) {
-      logger.info("Dry run: bootstrap simulation ok");
+      report.tx = {
+        dryRun: true,
+        expectedTokenId: expectedTokenId.toString()
+      };
+      report.stateAfter = stateBefore;
+      await outputReport(report, options);
       return;
     }
 
     const hash = await walletClient.writeContract({ ...simulation.request, account });
-    logger.info("Bootstrap tx sent", { hash, expectedTokenId: expectedTokenId.toString() });
-    await publicClient.waitForTransactionReceipt({ hash });
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
-    const [updatedTicks, updatedInitialized] = await Promise.all([
-      publicClient.readContract({
-        address: config.vaultAddress,
-        abi: rangeGuardVaultAbi,
-        functionName: "ticks"
-      }),
-      publicClient.readContract({
-        address: config.vaultAddress,
-        abi: rangeGuardVaultAbi,
-        functionName: "isPositionInitialized"
-      })
-    ]);
-    logger.info("Bootstrap status", {
-      initialized: updatedInitialized,
-      positionId: updatedTicks[3].toString(),
-      lower: Number(updatedTicks[0]),
-      upper: Number(updatedTicks[1]),
-      spacing: Number(updatedTicks[2])
-    });
+    const { state: stateAfter } = await fetchVaultState(config, publicClient, account);
+    const events = parseVaultEvents(receipt.logs, config.vaultAddress);
 
+    report.tx = {
+      dryRun: false,
+      hash,
+      blockNumber: receipt.blockNumber?.toString(),
+      events
+    };
+    report.stateAfter = stateAfter;
+
+    if (options.verbose) {
+      report.debug = {
+        ...(report.debug ?? {}),
+        receiptLogsCount: receipt.logs.length
+      };
+    }
+
+    await outputReport(report, options);
     await recordAction(config.policy, config.vaultAddress);
   } catch (err) {
     logger.error("Bootstrap failed", { error: formatError(err) });
