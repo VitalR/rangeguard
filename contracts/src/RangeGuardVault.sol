@@ -49,7 +49,8 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
     event PositionStateUpdated(uint256 indexed positionId, int24 tickLower, int24 tickUpper, int24 tickSpacing);
 
     /// @notice Emitted when the position state is cleared.
-    event PositionStateCleared();
+    /// @param positionId Position identifier cleared.
+    event PositionStateCleared(uint256 indexed positionId);
 
     /// @notice Emitted when the max slippage value is updated.
     /// @param bps Maximum slippage in basis points.
@@ -204,6 +205,7 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
 
     /// @notice Parameters for keeper-driven rebalances.
     struct RebalanceParams {
+        uint256 positionId;
         uint256 newPositionId;
         int24 newTickLower;
         int24 newTickUpper;
@@ -228,6 +230,7 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
 
     /// @notice Parameters for keeper-driven fee collection.
     struct CollectParams {
+        uint256 positionId;
         uint256 deadline;
         bytes unlockData;
         uint256 callValue;
@@ -254,8 +257,12 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
     uint16 public maxSlippageBps;
     /// @notice Policy version for non-enumerable policy changes.
     uint256 public policyVersion;
-    /// @notice Current position metadata.
-    PositionState public position;
+    /// @notice Stored positions by id.
+    mapping(uint256 => PositionState) private positions;
+    /// @notice Ordered list of tracked position ids.
+    uint256[] private positionIds;
+    /// @notice Position id to index+1 mapping for quick removal.
+    mapping(uint256 => uint256) private positionIndex;
 
     // =============================================================
     //        ACCESS CONTROL & CONSTRUCTOR & RECEIVE/FALLBACK
@@ -345,7 +352,6 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Bootstrap the initial position via Uniswap v4 PositionManager.
     /// @param _p Bootstrap parameters built by the keeper.
     function bootstrapPosition(BootstrapParams calldata _p) external onlyKeeper whenNotPaused nonReentrant {
-        require(!position.initialized, PositionAlreadyInitialized());
         if (block.timestamp > _p.deadline) revert DeadlineExpired(block.timestamp, _p.deadline);
 
         _validateTicks(_p.tickLower, _p.tickUpper, _p.tickSpacing);
@@ -354,6 +360,7 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
         if (_p.callValue > available) revert InsufficientETH(available, _p.callValue);
 
         uint256 expectedId = _nextTokenId();
+        if (positions[expectedId].initialized) revert PositionAlreadyInitialized();
         _applyApprovals(_p.maxApprove0, _p.maxApprove1);
         _applyPermit2Allowances(_p.maxApprove0, _p.maxApprove1, _p.deadline);
 
@@ -361,13 +368,7 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
 
         require(_ownsPosition(expectedId), NewPositionNotOwned(expectedId));
 
-        position = PositionState({
-            initialized: true,
-            positionId: expectedId,
-            tickLower: _p.tickLower,
-            tickUpper: _p.tickUpper,
-            tickSpacing: _p.tickSpacing
-        });
+        _storePosition(expectedId, _p.tickLower, _p.tickUpper, _p.tickSpacing);
 
         emit PositionStateUpdated(expectedId, _p.tickLower, _p.tickUpper, _p.tickSpacing);
         emit PositionBootstrapped(expectedId, _p.tickLower, _p.tickUpper, _p.tickSpacing, keccak256(_p.unlockData));
@@ -376,7 +377,8 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Collect fees/deltas via Uniswap v4 PositionManager.
     /// @param _p Collect parameters built by the keeper.
     function collect(CollectParams calldata _p) external onlyKeeper whenNotPaused nonReentrant {
-        require(position.initialized, PositionNotInitialized());
+        PositionState memory current = positions[_p.positionId];
+        require(current.initialized, PositionNotInitialized());
         if (block.timestamp > _p.deadline) revert DeadlineExpired(block.timestamp, _p.deadline);
 
         uint256 available = address(this).balance;
@@ -393,17 +395,47 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 balance1After = IERC20(address(token1)).balanceOf(address(this));
 
         emit FeesCollected(
-            position.positionId, balance0Before, balance1Before, balance0After, balance1After, keccak256(_p.unlockData)
+            _p.positionId, balance0Before, balance1Before, balance0After, balance1After, keccak256(_p.unlockData)
         );
+    }
+
+    /// @notice Close the current position by removing all liquidity and collecting fees.
+    /// @param _p Close parameters built by the keeper.
+    function closePosition(CollectParams calldata _p) external onlyKeeper whenNotPaused nonReentrant {
+        PositionState memory current = positions[_p.positionId];
+        require(current.initialized, PositionNotInitialized());
+        if (block.timestamp > _p.deadline) revert DeadlineExpired(block.timestamp, _p.deadline);
+
+        uint256 available = address(this).balance;
+        if (_p.callValue > available) revert InsufficientETH(available, _p.callValue);
+
+        uint256 balance0Before = IERC20(address(token0)).balanceOf(address(this));
+        uint256 balance1Before = IERC20(address(token1)).balanceOf(address(this));
+        uint256 positionId = _p.positionId;
+
+        _applyApprovals(_p.maxApprove0, _p.maxApprove1);
+        _applyPermit2Allowances(_p.maxApprove0, _p.maxApprove1, _p.deadline);
+        IPositionManager(positionManager).modifyLiquidities{ value: _p.callValue }(_p.unlockData, _p.deadline);
+
+        uint256 balance0After = IERC20(address(token0)).balanceOf(address(this));
+        uint256 balance1After = IERC20(address(token1)).balanceOf(address(this));
+
+        emit FeesCollected(
+            positionId, balance0Before, balance1Before, balance0After, balance1After, keccak256(_p.unlockData)
+        );
+
+        _removePosition(positionId);
+        emit PositionStateCleared(positionId);
     }
 
     /// @notice Rebalance the vault's position via Uniswap v4 PositionManager.
     /// @param _p Rebalance parameters built by the keeper.
     function rebalance(RebalanceParams calldata _p) external onlyKeeper whenNotPaused nonReentrant {
-        require(position.initialized, PositionNotInitialized());
+        PositionState memory current = positions[_p.positionId];
+        require(current.initialized, PositionNotInitialized());
         if (block.timestamp > _p.deadline) revert DeadlineExpired(block.timestamp, _p.deadline);
 
-        int24 spacing = position.tickSpacing;
+        int24 spacing = current.tickSpacing;
         _validateTicks(_p.newTickLower, _p.newTickUpper, spacing);
 
         uint256 expectedNewId = _p.newPositionId == 0 ? _nextTokenId() : _p.newPositionId;
@@ -417,13 +449,16 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
 
         if (!_ownsPosition(expectedNewId)) revert NewPositionNotOwned(expectedNewId);
 
-        uint256 oldPositionId = position.positionId;
-        int24 oldLower = position.tickLower;
-        int24 oldUpper = position.tickUpper;
+        uint256 oldPositionId = _p.positionId;
+        int24 oldLower = current.tickLower;
+        int24 oldUpper = current.tickUpper;
 
-        position.positionId = expectedNewId;
-        position.tickLower = _p.newTickLower;
-        position.tickUpper = _p.newTickUpper;
+        if (expectedNewId == oldPositionId) {
+            _storePosition(expectedNewId, _p.newTickLower, _p.newTickUpper, spacing);
+        } else {
+            _removePosition(oldPositionId);
+            _storePosition(expectedNewId, _p.newTickLower, _p.newTickUpper, spacing);
+        }
 
         emit PositionRebalanced(
             oldPositionId, expectedNewId, oldLower, oldUpper, _p.newTickLower, _p.newTickUpper, keccak256(_p.unlockData)
@@ -463,21 +498,17 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
     {
         _validateTicks(_tickLower, _tickUpper, _tickSpacing);
         require(_ownsPosition(_positionId), NewPositionNotOwned(_positionId));
-        position = PositionState({
-            initialized: true,
-            positionId: _positionId,
-            tickLower: _tickLower,
-            tickUpper: _tickUpper,
-            tickSpacing: _tickSpacing
-        });
+        _storePosition(_positionId, _tickLower, _tickUpper, _tickSpacing);
         emit PositionStateUpdated(_positionId, _tickLower, _tickUpper, _tickSpacing);
         _bumpPolicyVersion();
     }
 
     /// @notice Clear the stored position state.
-    function clearPositionState() external onlyOwner {
-        delete position;
-        emit PositionStateCleared();
+    /// @param _positionId Position identifier to clear.
+    function clearPositionState(uint256 _positionId) external onlyOwner {
+        require(positions[_positionId].initialized, PositionNotInitialized());
+        _removePosition(_positionId);
+        emit PositionStateCleared(_positionId);
         _bumpPolicyVersion();
     }
 
@@ -494,7 +525,7 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     // =============================================================
-    //         PUBLIC/EXTERNAL & INTERNAL UTILITY FUNCTIONS
+    //              PUBLIC/EXTERNAL VIEW FUNCTIONS
     // =============================================================
 
     /// @notice Read the vault balance of a supported asset.
@@ -506,14 +537,30 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     /// @notice Returns true if a position has been initialized.
-    function isPositionInitialized() external view returns (bool) {
-        return position.initialized;
+    /// @param _positionId Position identifier to query.
+    function isPositionInitialized(uint256 _positionId) external view returns (bool) {
+        return positions[_positionId].initialized;
     }
 
-    /// @notice Returns current tick configuration and position id.
-    function ticks() external view returns (int24 lower, int24 upper, int24 spacing, uint256 positionId) {
-        PositionState memory current = position;
+    /// @notice Returns current tick configuration for a position.
+    /// @param _positionId Position identifier to query.
+    function ticks(uint256 _positionId)
+        external
+        view
+        returns (int24 lower, int24 upper, int24 spacing, uint256 positionId)
+    {
+        PositionState memory current = positions[_positionId];
         return (current.tickLower, current.tickUpper, current.tickSpacing, current.positionId);
+    }
+
+    /// @notice Returns all tracked position ids.
+    function getPositionIds() external view returns (uint256[] memory) {
+        return positionIds;
+    }
+
+    /// @notice Returns how many positions are tracked.
+    function positionCount() external view returns (uint256) {
+        return positionIds.length;
     }
 
     /// @notice Hash current policy parameters for receipt binding.
@@ -534,6 +581,10 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
         );
     }
 
+    // =============================================================
+    //               INTERNAL UTILITY FUNCTIONS
+    // =============================================================
+
     /// @notice Validate tick range and spacing alignment.
     /// @param _lower Lower tick.
     /// @param _upper Upper tick.
@@ -543,6 +594,42 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
         require(_lower < _upper, InvalidTickRange(_lower, _upper));
         require(_isAligned(_lower, _spacing), TickNotAligned(_lower, _spacing));
         require(_isAligned(_upper, _spacing), TickNotAligned(_upper, _spacing));
+    }
+
+    /// @notice Store/update position metadata and tracking index.
+    /// @param _positionId Position identifier.
+    /// @param _tickLower Lower tick.
+    /// @param _tickUpper Upper tick.
+    /// @param _tickSpacing Tick spacing.
+    function _storePosition(uint256 _positionId, int24 _tickLower, int24 _tickUpper, int24 _tickSpacing) internal {
+        positions[_positionId] = PositionState({
+            initialized: true,
+            positionId: _positionId,
+            tickLower: _tickLower,
+            tickUpper: _tickUpper,
+            tickSpacing: _tickSpacing
+        });
+        if (positionIndex[_positionId] == 0) {
+            positionIds.push(_positionId);
+            positionIndex[_positionId] = positionIds.length;
+        }
+    }
+
+    /// @notice Remove a position from tracking.
+    /// @param _positionId Position identifier.
+    function _removePosition(uint256 _positionId) internal {
+        uint256 index = positionIndex[_positionId];
+        if (index != 0) {
+            uint256 lastId = positionIds[positionIds.length - 1];
+            uint256 slot = index - 1;
+            if (lastId != _positionId) {
+                positionIds[slot] = lastId;
+                positionIndex[lastId] = index;
+            }
+            positionIds.pop();
+            delete positionIndex[_positionId];
+        }
+        delete positions[_positionId];
     }
 
     /// @notice Check if a tick is aligned to a spacing (supports negatives).
@@ -603,6 +690,10 @@ contract RangeGuardVault is Ownable2Step, ReentrancyGuard, Pausable {
         }
     }
 
+    /// @notice Apply Permit2 allowance for a token to the PositionManager.
+    /// @param token Token to approve.
+    /// @param amount Amount to approve (uint160 max).
+    /// @param expiration Permit2 allowance expiration (uint48 max).
     function _applyPermit2Allowance(IERC20 token, uint256 amount, uint48 expiration) internal {
         if (amount > type(uint160).max) revert Permit2AmountTooLarge(amount);
 

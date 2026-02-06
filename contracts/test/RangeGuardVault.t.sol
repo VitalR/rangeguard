@@ -222,14 +222,60 @@ contract RangeGuardVaultTest is Test {
         emit RangeGuardVault.PositionStateUpdated(42, -20, 20, 10);
         vault.setPositionState(42, -20, 20, 10);
 
-        (int24 lower, int24 upper, int24 spacing, uint256 positionId) = vault.ticks();
+        (int24 lower, int24 upper, int24 spacing, uint256 positionId) = vault.ticks(42);
         assertEq(lower, -20);
         assertEq(upper, 20);
         assertEq(spacing, 10);
         assertEq(positionId, 42);
-        assertTrue(vault.isPositionInitialized());
+        assertTrue(vault.isPositionInitialized(42));
         assertEq(vault.policyVersion(), beforePolicy + 1);
         assertTrue(beforeHash != vault.hashPolicy());
+    }
+
+    function test_multiple_positions_tracked_and_cleared() public {
+        positionManager.mintTo(address(vault), 1);
+        positionManager.mintTo(address(vault), 2);
+
+        vm.startPrank(owner);
+        vault.setPositionState(1, -20, 20, 10);
+        vault.setPositionState(2, -30, 30, 10);
+        vm.stopPrank();
+
+        uint256[] memory ids = vault.getPositionIds();
+        assertEq(ids.length, 2);
+        assertTrue(vault.isPositionInitialized(1));
+        assertTrue(vault.isPositionInitialized(2));
+
+        vm.prank(owner);
+        vault.clearPositionState(1);
+
+        uint256[] memory remaining = vault.getPositionIds();
+        assertEq(remaining.length, 1);
+        assertEq(remaining[0], 2);
+        assertFalse(vault.isPositionInitialized(1));
+        assertTrue(vault.isPositionInitialized(2));
+    }
+
+    function test_position_count_and_clear_last() public {
+        assertEq(vault.positionCount(), 0);
+
+        positionManager.mintTo(address(vault), 1);
+        positionManager.mintTo(address(vault), 2);
+
+        vm.startPrank(owner);
+        vault.setPositionState(1, -20, 20, 10);
+        vault.setPositionState(2, -30, 30, 10);
+        vm.stopPrank();
+
+        assertEq(vault.positionCount(), 2);
+
+        vm.prank(owner);
+        vault.clearPositionState(2);
+
+        assertEq(vault.positionCount(), 1);
+        uint256[] memory ids = vault.getPositionIds();
+        assertEq(ids.length, 1);
+        assertEq(ids[0], 1);
     }
 
     function test_pause_unpause() public {
@@ -305,23 +351,29 @@ contract RangeGuardVaultTest is Test {
         positionManager.mintTo(address(vault), 42);
         vm.prank(owner);
         vault.setPositionState(42, -20, 20, 10);
-        assertTrue(vault.isPositionInitialized());
+        assertTrue(vault.isPositionInitialized(42));
 
         uint256 beforePolicy = vault.policyVersion();
         bytes32 beforeHash = vault.hashPolicy();
         vm.prank(owner);
-        vm.expectEmit(false, false, false, true, address(vault));
-        emit RangeGuardVault.PositionStateCleared();
-        vault.clearPositionState();
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit RangeGuardVault.PositionStateCleared(42);
+        vault.clearPositionState(42);
 
-        (int24 lower, int24 upper, int24 spacing, uint256 positionId) = vault.ticks();
+        (int24 lower, int24 upper, int24 spacing, uint256 positionId) = vault.ticks(42);
         assertEq(lower, 0);
         assertEq(upper, 0);
         assertEq(spacing, 0);
         assertEq(positionId, 0);
-        assertFalse(vault.isPositionInitialized());
+        assertFalse(vault.isPositionInitialized(42));
         assertEq(vault.policyVersion(), beforePolicy + 1);
         assertTrue(beforeHash != vault.hashPolicy());
+    }
+
+    function test_clear_position_state_reverts_when_missing() public {
+        vm.expectRevert(RangeGuardVault.PositionNotInitialized.selector);
+        vm.prank(owner);
+        vault.clearPositionState(123);
     }
 
     function test_deposit_after_unpause() public {

@@ -124,7 +124,7 @@ contract RangeGuardVaultKeeperTest is Test {
         assertGt(expiration0, block.timestamp);
         assertGt(expiration1, block.timestamp);
 
-        (int24 lower, int24 upper, int24 spacing, uint256 positionId) = vault.ticks();
+        (int24 lower, int24 upper, int24 spacing, uint256 positionId) = vault.ticks(42);
         assertEq(positionId, 42);
         assertEq(lower, -10);
         assertEq(upper, 10);
@@ -190,7 +190,7 @@ contract RangeGuardVaultKeeperTest is Test {
         vm.prank(keeper);
         vault.rebalance(params);
 
-        (,,, uint256 positionId) = vault.ticks();
+        (,,, uint256 positionId) = vault.ticks(expected);
         assertEq(positionId, expected);
     }
 
@@ -229,6 +229,53 @@ contract RangeGuardVaultKeeperTest is Test {
         vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.InsufficientETH.selector, uint256(0), uint256(123)));
         vm.prank(keeper);
         vault.rebalance(params);
+    }
+
+    function test_rebalance_only_updates_target_position() public {
+        positionManager.mintTo(address(vault), 1);
+        positionManager.mintTo(address(vault), 2);
+
+        vm.startPrank(owner);
+        vault.setPositionState(1, -20, 20, 10);
+        vault.setPositionState(2, -40, 40, 10);
+        vm.stopPrank();
+
+        positionManager.setExpectedNewTokenId(3);
+
+        RangeGuardVault.RebalanceParams memory params = _defaultParams();
+        params.positionId = 1;
+        params.newPositionId = 3;
+        params.newTickLower = -10;
+        params.newTickUpper = 10;
+
+        vm.prank(keeper);
+        vault.rebalance(params);
+
+        assertFalse(vault.isPositionInitialized(1));
+        assertTrue(vault.isPositionInitialized(2));
+        assertTrue(vault.isPositionInitialized(3));
+    }
+
+    function test_rebalance_updates_same_position_id() public {
+        _initPosition();
+        positionManager.setMintOnModify(false);
+
+        RangeGuardVault.RebalanceParams memory params = _defaultParams();
+        params.positionId = 1;
+        params.newPositionId = 1;
+        params.newTickLower = -10;
+        params.newTickUpper = 10;
+
+        vm.prank(keeper);
+        vault.rebalance(params);
+
+        (int24 lower, int24 upper, int24 spacing, uint256 positionId) = vault.ticks(1);
+        assertEq(positionId, 1);
+        assertEq(lower, -10);
+        assertEq(upper, 10);
+        assertEq(spacing, 10);
+        assertTrue(vault.isPositionInitialized(1));
+        assertEq(vault.getPositionIds().length, 1);
     }
 
     //--------------------------------Bootstrap tests--------------------------------
@@ -343,17 +390,31 @@ contract RangeGuardVaultKeeperTest is Test {
         vm.prank(keeper);
         vault.bootstrapPosition(p);
 
-        assertTrue(vault.isPositionInitialized());
-        (int24 lower, int24 upper, int24 spacing, uint256 positionId) = vault.ticks();
+        assertTrue(vault.isPositionInitialized(expectedId));
+        (int24 lower, int24 upper, int24 spacing, uint256 positionId) = vault.ticks(expectedId);
         assertEq(positionId, expectedId);
         assertEq(lower, p.tickLower);
         assertEq(upper, p.tickUpper);
         assertEq(spacing, p.tickSpacing);
     }
 
-    function test_bootstrap_reverts_if_already_initialized() public {
+    function test_bootstrap_allows_multiple_positions() public {
         vm.prank(keeper);
         vault.bootstrapPosition(_bootstrapParams());
+
+        vm.prank(keeper);
+        vault.bootstrapPosition(_bootstrapParams());
+
+        uint256[] memory ids = vault.getPositionIds();
+        assertEq(ids.length, 2);
+    }
+
+    function test_bootstrap_reverts_when_position_id_already_tracked() public {
+        positionManager.mintTo(address(vault), 1);
+        vm.prank(owner);
+        vault.setPositionState(1, -20, 20, 10);
+
+        positionManager.setNextTokenId(1);
 
         vm.expectRevert(RangeGuardVault.PositionAlreadyInitialized.selector);
         vm.prank(keeper);
@@ -395,7 +456,12 @@ contract RangeGuardVaultKeeperTest is Test {
         positionManager.setMintOnModify(false);
 
         RangeGuardVault.CollectParams memory p = RangeGuardVault.CollectParams({
-            deadline: block.timestamp + 1 hours, unlockData: hex"c0ffee", callValue: 0, maxApprove0: 0, maxApprove1: 0
+            positionId: 1,
+            deadline: block.timestamp + 1 hours,
+            unlockData: hex"c0ffee",
+            callValue: 0,
+            maxApprove0: 0,
+            maxApprove1: 0
         });
 
         uint256 b0Before = token0.balanceOf(address(vault));
@@ -419,7 +485,12 @@ contract RangeGuardVaultKeeperTest is Test {
         positionManager.setRequiredAllowances(10, 20);
 
         RangeGuardVault.CollectParams memory p = RangeGuardVault.CollectParams({
-            deadline: block.timestamp + 1 hours, unlockData: hex"c0ffee", callValue: 0, maxApprove0: 10, maxApprove1: 20
+            positionId: 1,
+            deadline: block.timestamp + 1 hours,
+            unlockData: hex"c0ffee",
+            callValue: 0,
+            maxApprove0: 10,
+            maxApprove1: 20
         });
 
         vm.prank(keeper);
@@ -440,11 +511,31 @@ contract RangeGuardVaultKeeperTest is Test {
 
     function test_collect_reverts_when_not_initialized() public {
         RangeGuardVault.CollectParams memory p = RangeGuardVault.CollectParams({
-            deadline: block.timestamp + 1 hours, unlockData: hex"c0ffee", callValue: 0, maxApprove0: 0, maxApprove1: 0
+            positionId: 1,
+            deadline: block.timestamp + 1 hours,
+            unlockData: hex"c0ffee",
+            callValue: 0,
+            maxApprove0: 0,
+            maxApprove1: 0
         });
 
         vm.expectRevert(RangeGuardVault.PositionNotInitialized.selector);
         vm.prank(keeper);
+        vault.collect(p);
+    }
+
+    function test_collect_only_keeper() public {
+        RangeGuardVault.CollectParams memory p = RangeGuardVault.CollectParams({
+            positionId: 1,
+            deadline: block.timestamp + 1 hours,
+            unlockData: hex"c0ffee",
+            callValue: 0,
+            maxApprove0: 0,
+            maxApprove1: 0
+        });
+
+        vm.expectRevert(RangeGuardVault.NotKeeper.selector);
+        vm.prank(user);
         vault.collect(p);
     }
 
@@ -454,7 +545,7 @@ contract RangeGuardVaultKeeperTest is Test {
 
         uint256 nowTs = block.timestamp;
         RangeGuardVault.CollectParams memory p = RangeGuardVault.CollectParams({
-            deadline: nowTs - 1, unlockData: hex"c0ffee", callValue: 0, maxApprove0: 0, maxApprove1: 0
+            positionId: 1, deadline: nowTs - 1, unlockData: hex"c0ffee", callValue: 0, maxApprove0: 0, maxApprove1: 0
         });
 
         vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.DeadlineExpired.selector, nowTs, nowTs - 1));
@@ -467,7 +558,12 @@ contract RangeGuardVaultKeeperTest is Test {
         vault.bootstrapPosition(_bootstrapParams());
 
         RangeGuardVault.CollectParams memory p = RangeGuardVault.CollectParams({
-            deadline: block.timestamp + 1 hours, unlockData: hex"c0ffee", callValue: 123, maxApprove0: 0, maxApprove1: 0
+            positionId: 1,
+            deadline: block.timestamp + 1 hours,
+            unlockData: hex"c0ffee",
+            callValue: 123,
+            maxApprove0: 0,
+            maxApprove1: 0
         });
 
         vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.InsufficientETH.selector, uint256(0), uint256(123)));
@@ -475,10 +571,136 @@ contract RangeGuardVaultKeeperTest is Test {
         vault.collect(p);
     }
 
+    //--------------------------------Close position tests--------------------------------
+
+    function test_close_position_clears_state_and_collects() public {
+        _initPosition();
+
+        positionManager.setMintOnModify(false);
+        token0.mint(address(positionManager), 123);
+        token1.mint(address(positionManager), 456 ether);
+        positionManager.setPayout(123, 456 ether);
+
+        RangeGuardVault.CollectParams memory p = RangeGuardVault.CollectParams({
+            positionId: 1,
+            deadline: block.timestamp + 1 hours,
+            unlockData: hex"c0ffee",
+            callValue: 0,
+            maxApprove0: 0,
+            maxApprove1: 0
+        });
+
+        uint256 b0Before = token0.balanceOf(address(vault));
+        uint256 b1Before = token1.balanceOf(address(vault));
+
+        vm.prank(keeper);
+        vault.closePosition(p);
+
+        uint256 b0After = token0.balanceOf(address(vault));
+        uint256 b1After = token1.balanceOf(address(vault));
+
+        assertEq(b0After, b0Before + 123);
+        assertEq(b1After, b1Before + 456 ether);
+        assertFalse(vault.isPositionInitialized(1));
+        assertEq(vault.getPositionIds().length, 0);
+    }
+
+    function test_close_position_only_keeper() public {
+        _initPosition();
+
+        RangeGuardVault.CollectParams memory p = RangeGuardVault.CollectParams({
+            positionId: 1,
+            deadline: block.timestamp + 1 hours,
+            unlockData: hex"c0ffee",
+            callValue: 0,
+            maxApprove0: 0,
+            maxApprove1: 0
+        });
+
+        vm.expectRevert(RangeGuardVault.NotKeeper.selector);
+        vm.prank(user);
+        vault.closePosition(p);
+    }
+
+    function test_close_position_deadline_expired() public {
+        _initPosition();
+
+        uint256 nowTs = block.timestamp;
+        RangeGuardVault.CollectParams memory p = RangeGuardVault.CollectParams({
+            positionId: 1, deadline: nowTs - 1, unlockData: hex"c0ffee", callValue: 0, maxApprove0: 0, maxApprove1: 0
+        });
+
+        vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.DeadlineExpired.selector, nowTs, nowTs - 1));
+        vm.prank(keeper);
+        vault.closePosition(p);
+    }
+
+    function test_close_position_only_removes_target() public {
+        positionManager.mintTo(address(vault), 1);
+        positionManager.mintTo(address(vault), 2);
+
+        vm.startPrank(owner);
+        vault.setPositionState(1, -20, 20, 10);
+        vault.setPositionState(2, -30, 30, 10);
+        vm.stopPrank();
+
+        positionManager.setMintOnModify(false);
+        RangeGuardVault.CollectParams memory p = RangeGuardVault.CollectParams({
+            positionId: 1,
+            deadline: block.timestamp + 1 hours,
+            unlockData: hex"c0ffee",
+            callValue: 0,
+            maxApprove0: 0,
+            maxApprove1: 0
+        });
+
+        vm.prank(keeper);
+        vault.closePosition(p);
+
+        assertFalse(vault.isPositionInitialized(1));
+        assertTrue(vault.isPositionInitialized(2));
+        uint256[] memory ids = vault.getPositionIds();
+        assertEq(ids.length, 1);
+        assertEq(ids[0], 2);
+    }
+
+    function test_close_position_reverts_when_not_initialized() public {
+        RangeGuardVault.CollectParams memory p = RangeGuardVault.CollectParams({
+            positionId: 1,
+            deadline: block.timestamp + 1 hours,
+            unlockData: hex"c0ffee",
+            callValue: 0,
+            maxApprove0: 0,
+            maxApprove1: 0
+        });
+
+        vm.expectRevert(RangeGuardVault.PositionNotInitialized.selector);
+        vm.prank(keeper);
+        vault.closePosition(p);
+    }
+
+    function test_close_position_reverts_if_call_value_exceeds_balance() public {
+        _initPosition();
+
+        RangeGuardVault.CollectParams memory p = RangeGuardVault.CollectParams({
+            positionId: 1,
+            deadline: block.timestamp + 1 hours,
+            unlockData: hex"c0ffee",
+            callValue: 123,
+            maxApprove0: 0,
+            maxApprove1: 0
+        });
+
+        vm.expectRevert(abi.encodeWithSelector(RangeGuardVault.InsufficientETH.selector, uint256(0), uint256(123)));
+        vm.prank(keeper);
+        vault.closePosition(p);
+    }
+
     //--------------------------------Internal helpers--------------------------------
 
     function _defaultParams() private view returns (RangeGuardVault.RebalanceParams memory params) {
         params = RangeGuardVault.RebalanceParams({
+            positionId: 1,
             newPositionId: 2,
             newTickLower: -20,
             newTickUpper: 20,

@@ -76,6 +76,12 @@ contract MockPositionManager {
         return _nextTokenId;
     }
 
+    /// @notice Test helper: set the next token id.
+    /// @param tokenId Token id to use for next mint.
+    function setNextTokenId(uint256 tokenId) external {
+        _nextTokenId = tokenId;
+    }
+
     /// @notice Test helper: pre-mint an id to a recipient.
     /// @param to Recipient of the token id.
     /// @param tokenId Token id to mint.
