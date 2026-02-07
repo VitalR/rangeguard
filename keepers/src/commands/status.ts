@@ -6,11 +6,14 @@ import { logger } from "../logger";
 import { formatError, invariant } from "../utils/errors";
 import { createRunId, outputReport, RunReport } from "../report";
 import { fetchVaultState } from "../vault/state";
+import { isPoolInitialized } from "../uniswap/poolState";
+import { isTickNearBounds, tickSanityMessage } from "../uniswap/sanity";
 
 export type StatusOptions = {
   json?: boolean;
   out?: string;
   verbose?: boolean;
+  positionId?: string;
 };
 
 export const statusCommand = async (options: StatusOptions = {}) => {
@@ -22,7 +25,12 @@ export const statusCommand = async (options: StatusOptions = {}) => {
     invariant(chainId === config.chainId, `Chain ID mismatch: RPC=${chainId}, expected=${config.chainId}`);
 
     const [{ state, context }, maxSlippageBps] = await Promise.all([
-      fetchVaultState(config, publicClient, account),
+      fetchVaultState(
+        config,
+        publicClient,
+        account,
+        options.positionId ? BigInt(options.positionId) : undefined
+      ),
       publicClient.readContract({
         address: config.vaultAddress,
         abi: rangeGuardVaultAbi,
@@ -36,7 +44,7 @@ export const statusCommand = async (options: StatusOptions = {}) => {
       warnings.push("Policy maxSlippageBps exceeds vault maxSlippageBps");
     }
 
-    if (context.initialized) {
+    if (context.position?.initialized) {
       const positionManagerAddress = config.positionManagerAddress ?? context.positionManager;
       await checkPermit2Allowances({
         publicClient,
@@ -48,9 +56,27 @@ export const statusCommand = async (options: StatusOptions = {}) => {
         required1: 0n,
         throwOnMissing: false
       });
+    } else if (!options.positionId && context.positionIds.length > 1) {
+      warnings.push("Multiple positions detected. Use --positionId to inspect one.");
     }
 
     const runId = createRunId();
+    const poolInit =
+      state.pool.tick !== null && state.pool.sqrtPriceX96
+        ? isPoolInitialized({
+            sqrtPriceX96: BigInt(state.pool.sqrtPriceX96),
+            tick: state.pool.tick
+          })
+        : { initialized: false, reason: "no slot0" };
+    const nearBounds = state.pool.tick !== null ? isTickNearBounds(state.pool.tick) : false;
+    if (nearBounds && state.pool.tick !== null) {
+      warnings.push(tickSanityMessage(state.pool.tick));
+    }
+    const actionHint = nearBounds
+      ? "Pool tick near global bounds. Run: npm run probePools"
+      : !poolInit.initialized
+        ? "Pool appears UNINITIALIZED. Run: npm run initPool -- --priceUsdcPerWeth 2000 --send"
+        : undefined;
     const report: RunReport = {
       runId,
       command: "status",
@@ -71,7 +97,8 @@ export const statusCommand = async (options: StatusOptions = {}) => {
       policy: config.policy,
       decision: { action: "execute", reason: "status" },
       stateBefore: state,
-      warnings
+      warnings,
+      plan: actionHint ? { poolInitialized: false, actionHint } : { poolInitialized: true }
     };
 
     await outputReport(report, options);

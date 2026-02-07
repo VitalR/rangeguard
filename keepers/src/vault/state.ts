@@ -8,6 +8,15 @@ import { centerRange } from "../uniswap/ticks";
 import { formatError, invariant } from "../utils/errors";
 import { logger } from "../logger";
 import { VaultState } from "../report";
+import { isPoolInitialized } from "../uniswap/poolState";
+
+export type PositionSnapshot = {
+  initialized: boolean;
+  positionId: bigint;
+  lower: number;
+  upper: number;
+  spacing: number;
+};
 
 export type VaultContext = {
   token0: `0x${string}`;
@@ -16,14 +25,15 @@ export type VaultContext = {
   token1Decimals: number;
   keeper: `0x${string}`;
   positionManager: `0x${string}`;
-  ticks: readonly [bigint, bigint, bigint, bigint];
-  initialized: boolean;
+  positionIds: bigint[];
+  position?: PositionSnapshot;
 };
 
 export const fetchVaultState = async (
   config: KeeperConfig,
   publicClient: any,
-  account?: { address: string }
+  account?: { address: string },
+  positionId?: bigint
 ): Promise<{ state: VaultState; context: VaultContext }> => {
   const [
     token0,
@@ -32,8 +42,7 @@ export const fetchVaultState = async (
     token1Decimals,
     keeper,
     positionManager,
-    ticks,
-    initialized
+    positionIds
   ] = await Promise.all([
     publicClient.readContract({
       address: config.vaultAddress,
@@ -68,12 +77,7 @@ export const fetchVaultState = async (
     publicClient.readContract({
       address: config.vaultAddress,
       abi: rangeGuardVaultAbi,
-      functionName: "ticks"
-    }),
-    publicClient.readContract({
-      address: config.vaultAddress,
-      abi: rangeGuardVaultAbi,
-      functionName: "isPositionInitialized"
+      functionName: "getPositionIds"
     })
   ]);
 
@@ -101,23 +105,47 @@ export const fetchVaultState = async (
     );
   }
 
-  const lower = Number(ticks[0]);
-  const upper = Number(ticks[1]);
-  const spacing = Number(ticks[2]);
-  const positionId = ticks[3] as bigint;
+  let selectedId: bigint | undefined = positionId;
+  if (selectedId === undefined && (positionIds as bigint[]).length === 1) {
+    selectedId = (positionIds as bigint[])[0];
+  }
+
+  let selectedPosition: PositionSnapshot | undefined;
+  if (selectedId !== undefined) {
+    const ticks = await publicClient.readContract({
+      address: config.vaultAddress,
+      abi: rangeGuardVaultAbi,
+      functionName: "ticks",
+      args: [selectedId]
+    });
+    const initialized = await publicClient.readContract({
+      address: config.vaultAddress,
+      abi: rangeGuardVaultAbi,
+      functionName: "isPositionInitialized",
+      args: [selectedId]
+    });
+    selectedPosition = {
+      initialized: Boolean(initialized),
+      positionId: selectedId,
+      lower: Number(ticks[0]),
+      upper: Number(ticks[1]),
+      spacing: Number(ticks[2])
+    };
+  }
 
   const token0Currency = new Token(config.chainId, token0, Number(token0Decimals));
   const token1Currency = new Token(config.chainId, token1, Number(token1Decimals));
 
   let currentTick: number | null = null;
   let poolId: string | null = null;
+  let sqrtPriceX96: bigint | null = null;
   const hooks = config.poolHooks ?? zeroAddress;
   const fee = config.poolFee;
   const tickSpacing = config.poolTickSpacing;
 
-  if (initialized) {
+  if (selectedPosition?.initialized) {
     const positionManagerAddress = config.positionManagerAddress ?? positionManager;
-    const poolKey = await getPoolKeyFromPosition(publicClient, positionManagerAddress, positionId);
+    const poolKey = await getPoolKeyFromPosition(publicClient, positionManagerAddress, selectedPosition.positionId);
     const poolState = await getPoolSlot0(
       publicClient,
       config.stateViewAddress,
@@ -127,6 +155,7 @@ export const fetchVaultState = async (
     );
     currentTick = poolState.tickCurrent;
     poolId = poolState.poolId;
+    sqrtPriceX96 = poolState.sqrtPriceX96;
   } else if (fee !== undefined && tickSpacing !== undefined) {
     const poolKey = buildPoolKey(token0Currency, token1Currency, fee, tickSpacing, hooks);
     const poolState = await getPoolSlot0(
@@ -138,6 +167,7 @@ export const fetchVaultState = async (
     );
     currentTick = poolState.tickCurrent;
     poolId = poolState.poolId;
+    sqrtPriceX96 = poolState.sqrtPriceX96;
   }
 
   if (poolId && config.poolId && config.poolId !== poolId) {
@@ -151,28 +181,39 @@ export const fetchVaultState = async (
   const edgeThresholdTicks = Math.max(1, Math.floor((widthTicks * config.policy.edgeBps) / 10_000));
 
   const inRange =
-    currentTick !== null && initialized ? currentTick > lower && currentTick < upper : null;
+    currentTick !== null && selectedPosition?.initialized
+      ? currentTick > selectedPosition.lower && currentTick < selectedPosition.upper
+      : null;
   const outOfRange =
-    currentTick !== null && initialized ? currentTick <= lower || currentTick >= upper : null;
+    currentTick !== null && selectedPosition?.initialized
+      ? currentTick <= selectedPosition.lower || currentTick >= selectedPosition.upper
+      : null;
   const nearEdge =
-    currentTick !== null && initialized
-      ? currentTick <= lower + edgeThresholdTicks || currentTick >= upper - edgeThresholdTicks
+    currentTick !== null && selectedPosition?.initialized
+      ? currentTick <= selectedPosition.lower + edgeThresholdTicks ||
+        currentTick >= selectedPosition.upper - edgeThresholdTicks
       : null;
 
   let healthBps: number | null = null;
-  const width = upper - lower;
-  if (currentTick !== null && initialized && width > 0) {
-    if (currentTick <= lower || currentTick >= upper) {
+  const width =
+    selectedPosition && selectedPosition.initialized
+      ? selectedPosition.upper - selectedPosition.lower
+      : 0;
+  if (currentTick !== null && selectedPosition?.initialized && width > 0) {
+    if (currentTick <= selectedPosition.lower || currentTick >= selectedPosition.upper) {
       healthBps = 0;
     } else {
-      const distance = Math.min(currentTick - lower, upper - currentTick);
+      const distance = Math.min(
+        currentTick - selectedPosition.lower,
+        selectedPosition.upper - currentTick
+      );
       healthBps = Math.max(0, Math.min(10_000, Math.floor((distance * 10_000) / width)));
     }
   }
 
-  if (currentTick !== null && spacing > 0) {
+  if (currentTick !== null && selectedPosition?.spacing && selectedPosition.spacing > 0) {
     try {
-      centerRange(currentTick, widthTicks, spacing);
+      centerRange(currentTick, widthTicks, selectedPosition.spacing);
     } catch (err) {
       logger.warn("Failed to compute suggested range", { error: formatError(err) });
     }
@@ -184,16 +225,25 @@ export const fetchVaultState = async (
       token1: token1Balance,
       eth: ethBalance
     },
-    position: {
-      initialized,
-      positionId: positionId.toString(),
-      lower,
-      upper,
-      spacing
-    },
+    position: selectedPosition
+      ? {
+          initialized: selectedPosition.initialized,
+          positionId: selectedPosition.positionId.toString(),
+          lower: selectedPosition.lower,
+          upper: selectedPosition.upper,
+          spacing: selectedPosition.spacing
+        }
+      : null,
+    positions: positionIds.map((id: bigint) => {
+      return {
+        initialized: true,
+        positionId: id.toString()
+      };
+    }),
     pool: {
       poolId,
-      tick: currentTick
+      tick: currentTick,
+      sqrtPriceX96: sqrtPriceX96 ? sqrtPriceX96.toString() : null
     },
     inRange,
     outOfRange,
@@ -208,8 +258,8 @@ export const fetchVaultState = async (
     token1Decimals: Number(token1Decimals),
     keeper,
     positionManager,
-    ticks: ticks as readonly [bigint, bigint, bigint, bigint],
-    initialized: Boolean(initialized)
+    positionIds: positionIds as bigint[],
+    position: selectedPosition
   };
 
   return { state, context };

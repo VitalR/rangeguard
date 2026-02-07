@@ -1,7 +1,7 @@
 import { parseUnits } from "viem";
 import { PublicClient } from "viem";
 import { Address, PoolKey } from "./types";
-import { KeeperError } from "./utils/errors";
+import { formatError, KeeperError } from "./utils/errors";
 import { applyBpsBuffer, formatQuotePrice, quoteExactInputSingle } from "./uniswap/quoter";
 
 type QuoteInput = {
@@ -142,23 +142,36 @@ export const selectAmounts = async (params: AmountSelectionParams): Promise<Amou
   if (amount0Input) {
     amount0 = clampAmount(parseUnits(amount0Input, token0Decimals), limit0, "token0", warnings);
     const zeroForOne = token0.toLowerCase() === poolKey.currency0.toLowerCase();
-    let quotedAmount1 = await quoteExact({
-      publicClient,
-      quoter: quoterAddress,
-      poolKey,
-      zeroForOne,
-      exactAmount: amount0,
-      hookData
-    });
-    let derivedAmount1 = applyBpsBuffer(quotedAmount1, bufferBps);
-    const price = formatQuotePrice(amount0, quotedAmount1, token0Decimals, token1Decimals);
-    quote = {
-      direction: "token0->token1",
-      amountIn: amount0,
-      amountOut: quotedAmount1,
-      bufferBps,
-      price
-    };
+    let quotedAmount1: bigint;
+    let derivedAmount1: bigint;
+    try {
+      quotedAmount1 = await quoteExact({
+        publicClient,
+        quoter: quoterAddress,
+        poolKey,
+        zeroForOne,
+        exactAmount: amount0,
+        hookData
+      });
+      derivedAmount1 = applyBpsBuffer(quotedAmount1, bufferBps);
+      const price = formatQuotePrice(amount0, quotedAmount1, token0Decimals, token1Decimals);
+      quote = {
+        direction: "token0->token1",
+        amountIn: amount0,
+        amountOut: quotedAmount1,
+        bufferBps,
+        price
+      };
+    } catch (err) {
+      if (limit1 <= 0n) {
+        throw new KeeperError("Quote failed and token1 balance is zero; provide --amount1 or enable useFullBalances", {
+          error: formatError(err)
+        });
+      }
+      warnings.push(`Quote failed; using full token1 balance (${formatError(err)})`);
+      amount1 = limit1;
+      return { amount0, amount1, derived, scaled, warnings };
+    }
 
     for (let i = 0; i < 5; i += 1) {
       if (derivedAmount1 <= limit1) {
@@ -198,23 +211,36 @@ export const selectAmounts = async (params: AmountSelectionParams): Promise<Amou
 
   amount1 = clampAmount(parseUnits(amount1Input ?? "0", token1Decimals), limit1, "token1", warnings);
   const zeroForOne = token1.toLowerCase() === poolKey.currency0.toLowerCase();
-  let quotedAmount0 = await quoteExact({
-    publicClient,
-    quoter: quoterAddress,
-    poolKey,
-    zeroForOne,
-    exactAmount: amount1,
-    hookData
-  });
-  let derivedAmount0 = applyBpsBuffer(quotedAmount0, bufferBps);
-  const price = formatQuotePrice(amount1, quotedAmount0, token1Decimals, token0Decimals);
-  quote = {
-    direction: "token1->token0",
-    amountIn: amount1,
-    amountOut: quotedAmount0,
-    bufferBps,
-    price
-  };
+  let quotedAmount0: bigint;
+  let derivedAmount0: bigint;
+  try {
+    quotedAmount0 = await quoteExact({
+      publicClient,
+      quoter: quoterAddress,
+      poolKey,
+      zeroForOne,
+      exactAmount: amount1,
+      hookData
+    });
+    derivedAmount0 = applyBpsBuffer(quotedAmount0, bufferBps);
+    const price = formatQuotePrice(amount1, quotedAmount0, token1Decimals, token0Decimals);
+    quote = {
+      direction: "token1->token0",
+      amountIn: amount1,
+      amountOut: quotedAmount0,
+      bufferBps,
+      price
+    };
+  } catch (err) {
+    if (limit0 <= 0n) {
+      throw new KeeperError("Quote failed and token0 balance is zero; provide --amount0 or enable useFullBalances", {
+        error: formatError(err)
+      });
+    }
+    warnings.push(`Quote failed; using full token0 balance (${formatError(err)})`);
+    amount0 = limit0;
+    return { amount0, amount1, derived, scaled, warnings };
+  }
 
   for (let i = 0; i < 5; i += 1) {
     if (derivedAmount0 <= limit0) {

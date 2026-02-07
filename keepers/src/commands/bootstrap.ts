@@ -5,7 +5,12 @@ import { loadConfig } from "../config";
 import { rangeGuardVaultAbi } from "../abi/RangeGuardVault";
 import { buildPoolKey, buildPoolFromState } from "../uniswap/pool";
 import { computeBootstrapTicks } from "../uniswap/ticks";
-import { buildPositionFromAmounts } from "../uniswap/position";
+import {
+  buildPositionFromAmounts,
+  computeBoundaryLiquidity,
+  computeBoundaryMinAmountForLiquidityOne,
+  getBoundarySqrtRatios
+} from "../uniswap/position";
 import { buildBootstrapUnlockData } from "../uniswap/planner";
 import { decodeUniswapError, extractRevertData, getRevertHint } from "../uniswap/errorDecoder";
 import { checkPermit2Allowances } from "../uniswap/permit2";
@@ -17,6 +22,8 @@ import { selectAmounts } from "../amounts";
 import { createRunId, hashCalldata, outputReport, RunReport } from "../report";
 import { parseVaultEvents } from "../vault/events";
 import { fetchVaultState } from "../vault/state";
+import { isPoolInitialized } from "../uniswap/poolState";
+import { assertTickNotNearBounds, isTickNearBounds, tickSanityMessage } from "../uniswap/sanity";
 
 type BootstrapOptions = {
   send?: boolean;
@@ -24,6 +31,7 @@ type BootstrapOptions = {
   amount1?: string;
   bufferBps?: string;
   maxSpendBps?: string;
+  widthTicks?: string;
   json?: boolean;
   out?: string;
   verbose?: boolean;
@@ -49,8 +57,10 @@ export const bootstrapCommand = async (options: BootstrapOptions = {}) => {
       })
     ]);
 
-    if (context.initialized) {
-      throw new KeeperError("Vault position already initialized");
+    if (context.positionIds.length > 0) {
+      logger.warn("Vault already tracks positions; bootstrap will add another", {
+        positionIds: context.positionIds.map((id) => id.toString())
+      });
     }
 
     if (config.policy.maxSlippageBps > Number(maxSlippageBps)) {
@@ -68,7 +78,7 @@ export const bootstrapCommand = async (options: BootstrapOptions = {}) => {
     const token1Currency = new Token(config.chainId, context.token1, Number(context.token1Decimals));
     const poolKey = buildPoolKey(token0Currency, token1Currency, fee, tickSpacing, hooks);
 
-    const { pool, poolId, tickCurrent } = await buildPoolFromState(
+    const { pool, poolId, tickCurrent, sqrtPriceX96 } = await buildPoolFromState(
       publicClient,
       config.stateViewAddress,
       {
@@ -83,9 +93,49 @@ export const bootstrapCommand = async (options: BootstrapOptions = {}) => {
       config.poolId
     );
 
-    const { lower, upper } = computeBootstrapTicks(tickCurrent, tickSpacing, config.policy.widthTicks);
+    const poolInit = isPoolInitialized({ sqrtPriceX96, tick: tickCurrent });
+    if (!poolInit.initialized && sqrtPriceX96 === 0n) {
+      throw new KeeperError(
+        `Pool appears UNINITIALIZED (${poolInit.reason}). Run: npm run initPool -- --priceUsdcPerWeth 2000 --send`,
+        { poolId, poolKey }
+      );
+    }
+    assertTickNotNearBounds(tickCurrent);
+
+    const widthTicks =
+      options.widthTicks !== undefined ? Number(options.widthTicks) : config.policy.widthTicks;
+    if (!Number.isFinite(widthTicks) || widthTicks <= 0) {
+      throw new KeeperError("widthTicks must be a positive integer");
+    }
+    if (widthTicks % tickSpacing !== 0 || widthTicks % (2 * tickSpacing) !== 0) {
+      throw new KeeperError("widthTicks/2 must align to tick spacing");
+    }
+    const policy = { ...config.policy, widthTicks };
+
+    const { lower, upper, mode, maxAligned, minAligned } = computeBootstrapTicks(
+      tickCurrent,
+      tickSpacing,
+      widthTicks
+    );
 
     await assertCooldown(config.policy, config.vaultAddress, "bootstrap");
+
+    const bootstrapWarnings: string[] = [];
+    if (tickCurrent >= maxAligned || tickCurrent <= minAligned) {
+      bootstrapWarnings.push(
+        "Pool tick is at extreme bound; pool may be uninitialized or POOL_ID/fee/spacing/hooks may be wrong"
+      );
+    }
+    if (isTickNearBounds(tickCurrent)) {
+      bootstrapWarnings.push(tickSanityMessage(tickCurrent));
+    }
+    if (mode !== "IN_RANGE") {
+      bootstrapWarnings.push(
+        `Boundary tick mode active (${mode}); mint will be one-sided. Consider initializing a fresh demo pool if you need inRange.`
+      );
+    } else if (tickCurrent < lower || tickCurrent >= upper) {
+      bootstrapWarnings.push("Computed bootstrap range does not include current tick");
+    }
 
     const amountSelection = await selectAmounts({
       publicClient,
@@ -98,17 +148,42 @@ export const bootstrapCommand = async (options: BootstrapOptions = {}) => {
       balance1: stateBefore.balances.token1,
       amount0Input: options.amount0,
       amount1Input: options.amount1,
-      useFullBalances: config.policy.useFullBalances,
+      useFullBalances: policy.useFullBalances,
       quoterAddress: config.quoterAddress,
-      hookData: config.policy.hookDataHex,
+      hookData: policy.hookDataHex,
       bufferBps: options.bufferBps ? Number(options.bufferBps) : undefined,
       maxSpendBps: options.maxSpendBps ? Number(options.maxSpendBps) : undefined
     });
 
-    const amount0 = amountSelection.amount0;
-    const amount1 = amountSelection.amount1;
+    let amount0 = amountSelection.amount0;
+    let amount1 = amountSelection.amount1;
+    const mintMode = mode === "ABOVE_MAX" ? "token1-only" : mode === "BELOW_MIN" ? "token0-only" : "in-range";
 
-    if (lower <= tickCurrent && tickCurrent < upper) {
+    const maxSpendBps = options.maxSpendBps ? Number(options.maxSpendBps) : 10_000;
+    const limit0 = (stateBefore.balances.token0 * BigInt(maxSpendBps)) / 10_000n;
+    const limit1 = (stateBefore.balances.token1 * BigInt(maxSpendBps)) / 10_000n;
+
+    if (mode === "ABOVE_MAX") {
+      if (amount1 <= 0n) {
+        throw new KeeperError("Pool tick beyond max aligned tick; token1-only mint requires amount1 > 0", {
+          amount0,
+          amount1
+        });
+      }
+      if (amount0 > 0n) {
+        amount0 = 0n;
+      }
+    } else if (mode === "BELOW_MIN") {
+      if (amount0 <= 0n) {
+        throw new KeeperError("Pool tick below min aligned tick; token0-only mint requires amount0 > 0", {
+          amount0,
+          amount1
+        });
+      }
+      if (amount1 > 0n) {
+        amount1 = 0n;
+      }
+    } else if (lower <= tickCurrent && tickCurrent < upper) {
       if (amount0 <= 0n || amount1 <= 0n) {
         throw new KeeperError(
           "Range includes current tick; both token balances must be > 0. Deposit WETH to the vault and retry.",
@@ -117,17 +192,88 @@ export const bootstrapCommand = async (options: BootstrapOptions = {}) => {
       }
     }
 
-    const position = buildPositionFromAmounts({
-      pool,
-      tickLower: lower,
-      tickUpper: upper,
-      amount0,
-      amount1
-    });
-
-    const liquidity = toBigInt(position.liquidity);
+    let liquidity: bigint;
+    let boundaryMinAmount: bigint | undefined;
+    if (mode === "IN_RANGE") {
+      const position = buildPositionFromAmounts({
+        pool,
+        tickLower: lower,
+        tickUpper: upper,
+        amount0,
+        amount1
+      });
+      liquidity = toBigInt(position.liquidity);
+    } else {
+      const boundaryDetails = getBoundarySqrtRatios(lower, upper);
+      boundaryMinAmount = computeBoundaryMinAmountForLiquidityOne({
+        tickLower: lower,
+        tickUpper: upper,
+        mode
+      });
+      if (options.verbose) {
+        logger.info("Boundary mint math", {
+          tickLower: lower,
+          tickUpper: upper,
+          sqrtLowerX96: boundaryDetails.sqrtLowerX96.toString(),
+          sqrtUpperX96: boundaryDetails.sqrtUpperX96.toString(),
+          diff: boundaryDetails.diff.toString(),
+          amount0: amount0.toString(),
+          amount1: amount1.toString(),
+          minAmount: boundaryMinAmount.toString()
+        });
+      }
+      if (mode === "ABOVE_MAX" && amount1 < boundaryMinAmount) {
+        if (limit1 >= boundaryMinAmount) {
+          amount1 = boundaryMinAmount;
+          bootstrapWarnings.push(
+            `amount1 bumped to minimum required for boundary mint (${boundaryMinAmount.toString()})`
+          );
+        } else {
+          throw new KeeperError("amount1 too low for boundary mint; deposit more token1", {
+            requiredAmount1: boundaryMinAmount.toString(),
+            maxSpendAmount1: limit1.toString()
+          });
+        }
+      } else if (mode === "BELOW_MIN" && amount0 < boundaryMinAmount) {
+        if (limit0 >= boundaryMinAmount) {
+          amount0 = boundaryMinAmount;
+          bootstrapWarnings.push(
+            `amount0 bumped to minimum required for boundary mint (${boundaryMinAmount.toString()})`
+          );
+        } else {
+          throw new KeeperError("amount0 too low for boundary mint; deposit more token0", {
+            requiredAmount0: boundaryMinAmount.toString(),
+            maxSpendAmount0: limit0.toString()
+          });
+        }
+      }
+      liquidity = computeBoundaryLiquidity({
+        tickLower: lower,
+        tickUpper: upper,
+        amount0,
+        amount1,
+        mode
+      });
+      if (options.verbose) {
+        logger.info("Boundary liquidity result", {
+          amount0: amount0.toString(),
+          amount1: amount1.toString(),
+          liquidity: liquidity.toString()
+        });
+      }
+    }
     const amount0Max = amount0;
     const amount1Max = amount1;
+
+    if (liquidity <= 0n) {
+      throw new KeeperError("Computed liquidity is zero; adjust amounts or tick range", {
+        tickLower: lower,
+        tickUpper: upper,
+        amount0: amount0.toString(),
+        amount1: amount1.toString(),
+        mode
+      });
+    }
 
     const unlockData = buildBootstrapUnlockData({
       pool,
@@ -137,7 +283,7 @@ export const bootstrapCommand = async (options: BootstrapOptions = {}) => {
       amount0Max,
       amount1Max,
       owner: config.vaultAddress,
-      hookData: config.policy.hookDataHex
+      hookData: policy.hookDataHex
     });
 
     if (unlockData === "0x") {
@@ -145,6 +291,7 @@ export const bootstrapCommand = async (options: BootstrapOptions = {}) => {
     }
 
     const positionManagerAddress = config.positionManagerAddress ?? context.positionManager;
+    const deadline = deadlineFromNow(config.defaultDeadlineSeconds);
     await checkPermit2Allowances({
       publicClient,
       vault: config.vaultAddress,
@@ -153,10 +300,13 @@ export const bootstrapCommand = async (options: BootstrapOptions = {}) => {
       token1: context.token1,
       required0: amount0Max,
       required1: amount1Max,
-      throwOnMissing: false
+      throwOnMissing: false,
+      willSetPermit2: true,
+      maxApprove0: amount0Max,
+      maxApprove1: amount1Max,
+      deadline
     });
 
-    const deadline = deadlineFromNow(config.defaultDeadlineSeconds);
     const params = {
       tickLower: lower,
       tickUpper: upper,
@@ -237,7 +387,7 @@ export const bootstrapCommand = async (options: BootstrapOptions = {}) => {
         token0: { address: context.token0, decimals: context.token0Decimals },
         token1: { address: context.token1, decimals: context.token1Decimals }
       },
-      policy: config.policy,
+      policy,
       decision: { action: "execute", reason: dryRun ? "dry-run" : "send" },
       stateBefore,
       plan: {
@@ -245,13 +395,19 @@ export const bootstrapCommand = async (options: BootstrapOptions = {}) => {
         tickUpper: upper,
         tickSpacing,
         currentTick: tickCurrent,
+        boundaryMode: mode,
+        mintMode,
+        minAlignedTick: minAligned,
+        maxAlignedTick: maxAligned,
+        widthTicks,
         amount0: amount0.toString(),
         amount1: amount1.toString(),
         bufferBps: options.bufferBps ? Number(options.bufferBps) : 200,
         maxSpendBps: options.maxSpendBps ? Number(options.maxSpendBps) : 10_000,
-        quote: amountSelection.quote ?? null
+        quote: amountSelection.quote ?? null,
+        boundaryMinAmount: boundaryMinAmount?.toString()
       },
-      warnings: amountSelection.warnings
+      warnings: [...bootstrapWarnings, ...amountSelection.warnings]
     };
 
     if (options.verbose) {

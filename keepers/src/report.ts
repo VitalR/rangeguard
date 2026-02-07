@@ -15,10 +15,18 @@ export type VaultState = {
     lower: number;
     upper: number;
     spacing: number;
-  };
+  } | null;
+  positions?: Array<{
+    initialized: boolean;
+    positionId: string;
+    lower?: number;
+    upper?: number;
+    spacing?: number;
+  }>;
   pool: {
     poolId: string | null;
     tick: number | null;
+    sqrtPriceX96?: string | null;
   };
   inRange: boolean | null;
   outOfRange: boolean | null;
@@ -123,14 +131,20 @@ export const renderSummary = (report: RunReport): string => {
   const before = report.stateBefore;
   if (before) {
     lines.push(formatStateLine("Pool tick", before.pool.tick));
-    lines.push(
-      `Position: ${before.position.positionId} [${before.position.lower}, ${before.position.upper}] spacing ${before.position.spacing}`
-    );
-    lines.push(
-      `Range: inRange=${before.inRange ?? "n/a"} outOfRange=${before.outOfRange ?? "n/a"} nearEdge=${
-        before.nearEdge ?? "n/a"
-      } healthBps=${before.healthBps ?? "n/a"}`
-    );
+    if (before.position) {
+      lines.push(
+        `Position: ${before.position.positionId} [${before.position.lower}, ${before.position.upper}] spacing ${before.position.spacing}`
+      );
+      lines.push(
+        `Range: inRange=${before.inRange ?? "n/a"} outOfRange=${before.outOfRange ?? "n/a"} nearEdge=${
+          before.nearEdge ?? "n/a"
+        } healthBps=${before.healthBps ?? "n/a"}`
+      );
+    } else if (before.positions && before.positions.length > 0) {
+      lines.push(`Positions tracked: ${before.positions.length}`);
+    } else {
+      lines.push("Position: none");
+    }
     const token0Balance = formatUnitsSafe(before.balances.token0, report.tokens.token0.decimals);
     const token1Balance = formatUnitsSafe(before.balances.token1, report.tokens.token1.decimals);
     const ethBalance = formatUnitsSafe(before.balances.eth, 18);
@@ -155,16 +169,23 @@ export const renderSummary = (report: RunReport): string => {
         quote && quote.price
           ? ` quotePrice=${quote.price} bufferBps=${quote.bufferBps ?? "n/a"}`
           : "";
+      const modeLine = plan.boundaryMode ? ` mode=${plan.boundaryMode}` : "";
+      const mintLine = plan.mintMode ? ` mint=${plan.mintMode}` : "";
+      const currentLine = plan.currentTick !== undefined ? ` currentTick=${plan.currentTick}` : "";
+      const alignedLine =
+        plan.minAlignedTick !== undefined && plan.maxAlignedTick !== undefined
+          ? ` aligned[min=${plan.minAlignedTick}, max=${plan.maxAlignedTick}]`
+          : "";
       lines.push(
         `Plan: ticks [${plan.tickLower}, ${plan.tickUpper}] amount0=${plan.amount0 ?? "n/a"} amount1=${
           plan.amount1 ?? "n/a"
-        }${quoteLine}`
+        }${modeLine}${mintLine}${currentLine}${alignedLine}${quoteLine}`
       );
     } else if (plan.direction) {
+      const amountIn = plan.amountIn ?? plan.amount0 ?? plan.amount1 ?? "n/a";
+      const amountOut = plan.amountOut ?? plan.amount1 ?? plan.amount0 ?? "n/a";
       lines.push(
-        `Plan: ${plan.direction} amountIn=${plan.amount0 ?? plan.amount1 ?? "n/a"} amountOut=${
-          plan.amount1 ?? plan.amount0 ?? "n/a"
-        } bufferBps=${plan.bufferBps ?? "n/a"}`
+        `Plan: ${plan.direction} amountIn=${amountIn} amountOut=${amountOut} bufferBps=${plan.bufferBps ?? "n/a"}`
       );
     } else {
       lines.push(`Plan: ${JSON.stringify(report.plan)}`);
@@ -184,11 +205,17 @@ export const renderSummary = (report: RunReport): string => {
     const token0Balance = formatUnitsSafe(after.balances.token0, report.tokens.token0.decimals);
     const token1Balance = formatUnitsSafe(after.balances.token1, report.tokens.token1.decimals);
     const ethBalance = formatUnitsSafe(after.balances.eth, 18);
-    lines.push(
-      `Post: position=${after.position.positionId} [${after.position.lower}, ${after.position.upper}] spacing ${
-        after.position.spacing
-      }`
-    );
+    if (after.position) {
+      lines.push(
+        `Post: position=${after.position.positionId} [${after.position.lower}, ${after.position.upper}] spacing ${
+          after.position.spacing
+        }`
+      );
+    } else if (after.positions && after.positions.length > 0) {
+      lines.push(`Post: positions tracked=${after.positions.length}`);
+    } else {
+      lines.push("Post: position cleared");
+    }
     lines.push(`Post balances: token0=${token0Balance} token1=${token1Balance} eth=${ethBalance}`);
   }
 

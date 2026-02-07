@@ -5,6 +5,7 @@ import { positionManagerAbi } from "../abi/PositionManager";
 import { stateViewAbi } from "../abi/StateView";
 import { Address, Hex, PoolKey } from "../types";
 import { KeeperError } from "../utils/errors";
+import { parseSlot0 } from "./poolState";
 
 export const getPoolKeyFromPosition = async (
   publicClient: PublicClient,
@@ -71,13 +72,10 @@ export const buildPoolFromState = async (
     })
   ]);
 
-  const sqrtPriceX96 = slot0[0] as bigint;
-  const tickCurrent = Number(slot0[1]);
+  const parsed = parseSlot0(slot0 as readonly unknown[]);
+  const sqrtPriceX96 = parsed.sqrtPriceX96;
+  const tickCurrent = parsed.tick;
   const liquidity = liquidityRaw as bigint;
-
-  if (!Number.isFinite(tickCurrent)) {
-    throw new KeeperError("Invalid tick from StateView");
-  }
 
   const pool = new Pool(
     token0,
@@ -110,12 +108,9 @@ export const getPoolSlot0 = async (
     args: [poolId]
   });
 
-  const sqrtPriceX96 = slot0[0] as bigint;
-  const tickCurrent = Number(slot0[1]);
-
-  if (!Number.isFinite(tickCurrent)) {
-    throw new KeeperError("Invalid tick from StateView");
-  }
+  const parsed = parseSlot0(slot0 as readonly unknown[]);
+  const sqrtPriceX96 = parsed.sqrtPriceX96;
+  const tickCurrent = parsed.tick;
 
   return { poolId, tickCurrent, sqrtPriceX96 };
 };

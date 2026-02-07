@@ -79,6 +79,10 @@ const hints: Record<string, string> = {
   AllowanceExpired: "Permit2 allowance expired. Approve Permit2 for the vault or refresh allowance expiry.",
   InsufficientAllowance: "Permit2 allowance too low. Approve Permit2 for the vault with sufficient allowance.",
   PoolNotInitialized: "Pool is not initialized. Initialize the pool before bootstrapping.",
+  CannotUpdateEmptyPosition:
+    "Pool has no initialized state for this key. Verify POOL_FEE/POOL_TICK_SPACING/POOL_HOOKS/POOL_ID and initialize the pool if needed.",
+  PoolAlreadyInitialized: "Pool already initialized. No need to run initPool.",
+  InvalidSqrtPrice: "Invalid sqrtPriceX96. Check price input or pass --sqrtPriceX96 explicitly.",
   TickMisaligned: "Ticks are not aligned to spacing. Check tickSpacing and alignment.",
   TicksMisordered: "tickLower must be less than tickUpper.",
   TickLowerOutOfBounds: "tickLower is outside the valid range.",

@@ -73,6 +73,10 @@ type Permit2CheckParams = {
   required0: bigint;
   required1: bigint;
   throwOnMissing: boolean;
+  willSetPermit2?: boolean;
+  maxApprove0?: bigint;
+  maxApprove1?: bigint;
+  deadline?: bigint | number;
 };
 
 export const checkPermit2Allowances = async ({
@@ -83,7 +87,11 @@ export const checkPermit2Allowances = async ({
   token1,
   required0,
   required1,
-  throwOnMissing
+  throwOnMissing,
+  willSetPermit2,
+  maxApprove0,
+  maxApprove1,
+  deadline
 }: Permit2CheckParams) => {
   const permit2 = await getPermit2Address(publicClient, positionManager);
   const [permit2Allowance0, permit2Allowance1, erc20Allowance0, erc20Allowance1] = await Promise.all([
@@ -102,7 +110,22 @@ export const checkPermit2Allowances = async ({
     erc20Allowance1
   });
 
+  if (willSetPermit2 && ((maxApprove0 ?? 0n) > 0n || (maxApprove1 ?? 0n) > 0n)) {
+    logger.info("Permit2 allowances will be set by vault (bounded by maxApprove and deadline)", {
+      maxApprove0: (maxApprove0 ?? 0n).toString(),
+      maxApprove1: (maxApprove1 ?? 0n).toString(),
+      deadline: deadline?.toString()
+    });
+    return;
+  }
+
   const missing: string[] = [];
+  if (required0 > 0n && (maxApprove0 ?? required0) === 0n) {
+    missing.push("maxApprove0 is zero; vault will not set Permit2 allowance for token0");
+  }
+  if (required1 > 0n && (maxApprove1 ?? required1) === 0n) {
+    missing.push("maxApprove1 is zero; vault will not set Permit2 allowance for token1");
+  }
   if (required0 > 0n) {
     if (permit2Allowance0.expired) {
       missing.push("Permit2 allowance for token0 is expired");

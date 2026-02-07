@@ -5,7 +5,9 @@ import { loadConfig } from "../config";
 import { erc20Abi } from "../abi/ERC20";
 import { rangeGuardVaultAbi } from "../abi/RangeGuardVault";
 import { buildPoolKey, getPoolSlot0 } from "../uniswap/pool";
+import { isPoolInitialized } from "../uniswap/poolState";
 import { checkPermit2Allowances } from "../uniswap/permit2";
+import { isTickNearBounds, tickSanityMessage } from "../uniswap/sanity";
 import { logger } from "../logger";
 import { formatError, invariant, KeeperError } from "../utils/errors";
 
@@ -31,7 +33,7 @@ export const doctorCommand = async () => {
     const chainId = await publicClient.getChainId();
     invariant(chainId === config.chainId, `Chain ID mismatch: RPC=${chainId}, expected=${config.chainId}`);
 
-    const [vaultKeeper, positionManager, vaultToken0, vaultToken1, vaultTicks] = await Promise.all([
+    const [vaultKeeper, positionManager, vaultToken0, vaultToken1, positionIds] = await Promise.all([
       publicClient.readContract({
         address: config.vaultAddress,
         abi: rangeGuardVaultAbi,
@@ -55,7 +57,7 @@ export const doctorCommand = async () => {
       publicClient.readContract({
         address: config.vaultAddress,
         abi: rangeGuardVaultAbi,
-        functionName: "ticks"
+        functionName: "getPositionIds"
       })
     ]);
 
@@ -84,8 +86,18 @@ export const doctorCommand = async () => {
       }
     }
 
-    const spacingFromVault = Number(vaultTicks[2]);
-    const tickSpacing = config.poolTickSpacing ?? (spacingFromVault > 0 ? spacingFromVault : undefined);
+    let spacingFromVault: number | undefined;
+    if ((positionIds as bigint[]).length > 0) {
+      const ticks = await publicClient.readContract({
+        address: config.vaultAddress,
+        abi: rangeGuardVaultAbi,
+        functionName: "ticks",
+        args: [(positionIds as bigint[])[0]]
+      });
+      spacingFromVault = Number(ticks[2]);
+    }
+    const tickSpacing =
+      config.poolTickSpacing ?? (spacingFromVault && spacingFromVault > 0 ? spacingFromVault : undefined);
     const fee = config.poolFee;
     const hooks = config.poolHooks ?? zeroAddress;
 
@@ -128,7 +140,29 @@ export const doctorCommand = async () => {
         warnings.push(`POOL_ID override does not match derived poolId: derived=${poolState.poolId}, env=${config.poolId}`);
       }
 
-      logger.info("Pool state", { poolId: poolState.poolId, tick: poolState.tickCurrent });
+      const poolInit = isPoolInitialized({
+        sqrtPriceX96: poolState.sqrtPriceX96,
+        tick: poolState.tickCurrent
+      });
+      logger.info("Pool state", {
+        poolId: poolState.poolId,
+        tick: poolState.tickCurrent,
+        poolInitialized: poolInit.initialized,
+        reason: poolInit.reason
+      });
+      const nearBounds = isTickNearBounds(poolState.tickCurrent);
+      if (nearBounds) {
+        warnings.push(tickSanityMessage(poolState.tickCurrent));
+      }
+      if (!poolInit.initialized && !nearBounds) {
+        warnings.push(
+          `Pool appears UNINITIALIZED (${poolInit.reason}). Run: npm run initPool -- --priceUsdcPerWeth 2000 --send`
+        );
+        logger.warn("Derived pool key", {
+          poolKey,
+          derivedPoolId: poolState.poolId
+        });
+      }
       await checkPermit2Allowances({
         publicClient,
         vault: config.vaultAddress,

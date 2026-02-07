@@ -17,6 +17,8 @@ import { selectAmounts } from "../amounts";
 import { createRunId, hashCalldata, outputReport, RunReport } from "../report";
 import { parseVaultEvents } from "../vault/events";
 import { fetchVaultState } from "../vault/state";
+import { selectPositionId } from "../vault/positions";
+import { assertTickNotNearBounds } from "../uniswap/sanity";
 
 type RebalanceOptions = {
   send?: boolean;
@@ -26,9 +28,11 @@ type RebalanceOptions = {
   maxSpendBps?: string;
   force?: boolean;
   dryPlan?: boolean;
+  widthTicks?: string;
   json?: boolean;
   out?: string;
   verbose?: boolean;
+  positionId?: string;
 };
 
 const toBigInt = (value: { toString(): string } | bigint): bigint =>
@@ -42,8 +46,14 @@ export const rebalanceCommand = async (options: RebalanceOptions = {}) => {
     const chainId = await publicClient.getChainId();
     invariant(chainId === config.chainId, `Chain ID mismatch: RPC=${chainId}, expected=${config.chainId}`);
 
+    const { positionId } = await selectPositionId(
+      publicClient,
+      config.vaultAddress,
+      options.positionId
+    );
+
     const [{ state: stateBefore, context }, maxSlippageBps] = await Promise.all([
-      fetchVaultState(config, publicClient, account),
+      fetchVaultState(config, publicClient, account, positionId),
       publicClient.readContract({
         address: config.vaultAddress,
         abi: rangeGuardVaultAbi,
@@ -51,7 +61,7 @@ export const rebalanceCommand = async (options: RebalanceOptions = {}) => {
       })
     ]);
 
-    if (!context.initialized) {
+    if (!context.position?.initialized) {
       throw new KeeperError("Vault position not initialized");
     }
 
@@ -59,10 +69,19 @@ export const rebalanceCommand = async (options: RebalanceOptions = {}) => {
       throw new KeeperError("policy.maxSlippageBps exceeds vault maxSlippageBps");
     }
 
-    const lower = Number(context.ticks[0]);
-    const upper = Number(context.ticks[1]);
-    const spacing = Number(context.ticks[2]);
-    const positionId = context.ticks[3] as bigint;
+    const lower = Number(context.position.lower);
+    const upper = Number(context.position.upper);
+    const spacing = Number(context.position.spacing);
+
+    const widthTicks =
+      options.widthTicks !== undefined ? Number(options.widthTicks) : config.policy.widthTicks;
+    if (!Number.isFinite(widthTicks) || widthTicks <= 0 || !Number.isInteger(widthTicks)) {
+      throw new KeeperError("widthTicks must be a positive integer");
+    }
+    if (widthTicks % (2 * spacing) !== 0) {
+      throw new KeeperError("widthTicks/2 must align to tick spacing");
+    }
+    const policy = { ...config.policy, widthTicks };
 
     const positionManagerAddress = config.positionManagerAddress ?? context.positionManager;
     const poolKey = await getPoolKeyFromPosition(publicClient, positionManagerAddress, positionId);
@@ -77,15 +96,14 @@ export const rebalanceCommand = async (options: RebalanceOptions = {}) => {
       token1Currency,
       config.poolId
     );
+    assertTickNotNearBounds(tickCurrent);
 
-    const widthTicks = config.policy.widthTicks;
-    const edgeThresholdTicks = Math.max(1, Math.floor((widthTicks * config.policy.edgeBps) / 10_000));
+    const edgeThresholdTicks = Math.max(1, Math.floor((widthTicks * policy.edgeBps) / 10_000));
     const outOfRange = tickCurrent <= lower || tickCurrent >= upper;
     const nearEdge = tickCurrent <= lower + edgeThresholdTicks || tickCurrent >= upper - edgeThresholdTicks;
 
     const shouldRebalance =
-      (config.policy.rebalanceIfOutOfRange && outOfRange) ||
-      (config.policy.rebalanceIfNearEdge && nearEdge);
+      (policy.rebalanceIfOutOfRange && outOfRange) || (policy.rebalanceIfNearEdge && nearEdge);
 
     const runId = createRunId();
 
@@ -107,7 +125,7 @@ export const rebalanceCommand = async (options: RebalanceOptions = {}) => {
           token0: { address: context.token0, decimals: context.token0Decimals },
           token1: { address: context.token1, decimals: context.token1Decimals }
         },
-        policy: config.policy,
+        policy,
         decision: {
           action: "skip",
           reason: "Trigger conditions not met"
@@ -139,7 +157,7 @@ export const rebalanceCommand = async (options: RebalanceOptions = {}) => {
             token0: { address: context.token0, decimals: context.token0Decimals },
             token1: { address: context.token1, decimals: context.token1Decimals }
           },
-          policy: config.policy,
+          policy,
           decision: {
             action: "skip",
             reason: "Skipped due to cooldown"
@@ -156,6 +174,7 @@ export const rebalanceCommand = async (options: RebalanceOptions = {}) => {
 
     const { lower: newLower, upper: newUpper } = centerRange(tickCurrent, widthTicks, spacing);
 
+    const usedFallbackBalances = !policy.useFullBalances && !options.amount0 && !options.amount1;
     const amountSelection = await selectAmounts({
       publicClient,
       poolKey,
@@ -167,15 +186,28 @@ export const rebalanceCommand = async (options: RebalanceOptions = {}) => {
       balance1: stateBefore.balances.token1,
       amount0Input: options.amount0,
       amount1Input: options.amount1,
-      useFullBalances: config.policy.useFullBalances,
+      useFullBalances: policy.useFullBalances || usedFallbackBalances,
       quoterAddress: config.quoterAddress,
-      hookData: config.policy.hookDataHex,
+      hookData: policy.hookDataHex,
       bufferBps: options.bufferBps ? Number(options.bufferBps) : undefined,
       maxSpendBps: options.maxSpendBps ? Number(options.maxSpendBps) : undefined
     });
+    const amountWarnings = [...amountSelection.warnings];
+    if (usedFallbackBalances) {
+      amountWarnings.unshift("useFullBalances=false but no amounts provided; using full balances");
+    }
 
     const amount0 = amountSelection.amount0;
     const amount1 = amountSelection.amount1;
+
+    if (newLower <= tickCurrent && tickCurrent < newUpper) {
+      if (amount0 <= 0n || amount1 <= 0n) {
+        throw new KeeperError(
+          "Rebalance range includes current tick; both token balances must be > 0. Deposit token0/token1 and retry.",
+          { amount0, amount1 }
+        );
+      }
+    }
 
     const newPosition = buildPositionFromAmounts({
       pool,
@@ -185,7 +217,7 @@ export const rebalanceCommand = async (options: RebalanceOptions = {}) => {
       amount1
     });
 
-    const slippage = slippagePercent(config.policy.maxSlippageBps);
+    const slippage = slippagePercent(policy.maxSlippageBps);
     const mintAmounts = newPosition.mintAmountsWithSlippage(slippage);
     const newLiquidity = toBigInt(newPosition.liquidity);
     const amount0Max = toBigInt(mintAmounts.amount0);
@@ -213,6 +245,7 @@ export const rebalanceCommand = async (options: RebalanceOptions = {}) => {
 
     const unlockData = buildRebalanceUnlockData({
       pool,
+      poolKey,
       oldTokenId: positionId,
       oldLiquidity,
       amount0Min,
@@ -223,14 +256,16 @@ export const rebalanceCommand = async (options: RebalanceOptions = {}) => {
       amount0Max,
       amount1Max,
       owner: config.vaultAddress,
-      hookData: config.policy.hookDataHex
+      hookData: policy.hookDataHex
     });
 
+    const deadline = deadlineFromNow(config.defaultDeadlineSeconds);
     const params = {
+      positionId,
       newPositionId: 0n,
       newTickLower: newLower,
       newTickUpper: newUpper,
-      deadline: deadlineFromNow(config.defaultDeadlineSeconds),
+      deadline,
       unlockData,
       maxApprove0: amount0Max,
       maxApprove1: amount1Max,
@@ -245,7 +280,11 @@ export const rebalanceCommand = async (options: RebalanceOptions = {}) => {
       token1: context.token1,
       required0: amount0Max,
       required1: amount1Max,
-      throwOnMissing: false
+      throwOnMissing: false,
+      willSetPermit2: true,
+      maxApprove0: amount0Max,
+      maxApprove1: amount1Max,
+      deadline
     });
 
     const dryRun = !options.send;
@@ -268,21 +307,23 @@ export const rebalanceCommand = async (options: RebalanceOptions = {}) => {
           token0: { address: context.token0, decimals: context.token0Decimals },
           token1: { address: context.token1, decimals: context.token1Decimals }
         },
-        policy: config.policy,
+        policy,
         decision: { action: "execute", reason: "dryPlan" },
         stateBefore,
-        plan: {
-          tickLower: newLower,
-          tickUpper: newUpper,
-          tickSpacing: spacing,
-          currentTick: tickCurrent,
-          amount0: amount0.toString(),
-          amount1: amount1.toString(),
-          bufferBps: options.bufferBps ? Number(options.bufferBps) : 200,
-          maxSpendBps: options.maxSpendBps ? Number(options.maxSpendBps) : 10_000,
-          quote: amountSelection.quote ?? null
-        },
-        warnings: amountSelection.warnings
+      plan: {
+        positionId: positionId.toString(),
+        tickLower: newLower,
+        tickUpper: newUpper,
+        tickSpacing: spacing,
+        currentTick: tickCurrent,
+        widthTicks,
+        amount0: amount0.toString(),
+        amount1: amount1.toString(),
+        bufferBps: options.bufferBps ? Number(options.bufferBps) : 200,
+        maxSpendBps: options.maxSpendBps ? Number(options.maxSpendBps) : 10_000,
+        quote: amountSelection.quote ?? null
+      },
+        warnings: amountWarnings
       };
       await outputReport(report, options);
       return;
@@ -322,21 +363,23 @@ export const rebalanceCommand = async (options: RebalanceOptions = {}) => {
         token0: { address: context.token0, decimals: context.token0Decimals },
         token1: { address: context.token1, decimals: context.token1Decimals }
       },
-      policy: config.policy,
+      policy,
       decision: { action: "execute", reason: dryRun ? "dry-run" : "send" },
       stateBefore,
       plan: {
+        positionId: positionId.toString(),
         tickLower: newLower,
         tickUpper: newUpper,
         tickSpacing: spacing,
         currentTick: tickCurrent,
+        widthTicks,
         amount0: amount0.toString(),
         amount1: amount1.toString(),
         bufferBps: options.bufferBps ? Number(options.bufferBps) : 200,
         maxSpendBps: options.maxSpendBps ? Number(options.maxSpendBps) : 10_000,
         quote: amountSelection.quote ?? null
       },
-      warnings: amountSelection.warnings
+      warnings: amountWarnings
     };
 
     if (options.verbose) {

@@ -57,6 +57,8 @@ const envSchema = z.object({
   POSITION_MANAGER_ADDRESS: optionalAddress,
   POOL_MANAGER_ADDRESS: optionalAddress,
   QUOTER_ADDRESS: optionalAddress,
+  SWAP_ROUTER_ADDRESS: optionalAddress,
+  PERMIT2: optionalAddress,
   CHAIN_ID: z.string().optional(),
   DRY_RUN: z.string().optional(),
   DEFAULT_DEADLINE_SECONDS: z.string().optional(),
@@ -88,8 +90,21 @@ const loadPolicyFromFile = async (policyPath: string): Promise<PolicyConfig> => 
   return { ...policy, hookDataHex: policy.hookDataHex as PolicyConfig["hookDataHex"] };
 };
 
+const normalizeJsonInput = (value: string): string => {
+  let normalized = value.trim();
+  normalized = normalized.replace(/\\+\s*$/, "");
+  normalized = normalized.trim();
+  if (
+    (normalized.startsWith("'") && normalized.endsWith("'")) ||
+    (normalized.startsWith('"') && normalized.endsWith('"'))
+  ) {
+    normalized = normalized.slice(1, -1);
+  }
+  return normalized.trim();
+};
+
 const loadPolicyFromJson = (policyJson: string): PolicyConfig => {
-  const parsed = JSON.parse(policyJson) as unknown;
+  const parsed = JSON.parse(normalizeJsonInput(policyJson)) as unknown;
   const policy = policySchema.parse(parsed);
   return { ...policy, hookDataHex: policy.hookDataHex as PolicyConfig["hookDataHex"] };
 };
@@ -139,6 +154,10 @@ export const loadConfig = async (): Promise<KeeperConfig> => {
     env.POOL_MANAGER_ADDRESS && env.POOL_MANAGER_ADDRESS !== "" ? env.POOL_MANAGER_ADDRESS : undefined
   );
   const quoterAddress = normalizeAddress(env.QUOTER_ADDRESS && env.QUOTER_ADDRESS !== "" ? env.QUOTER_ADDRESS : undefined);
+  const swapRouterAddress = normalizeAddress(
+    env.SWAP_ROUTER_ADDRESS && env.SWAP_ROUTER_ADDRESS !== "" ? env.SWAP_ROUTER_ADDRESS : undefined
+  );
+  const permit2Address = normalizeAddress(env.PERMIT2 && env.PERMIT2 !== "" ? env.PERMIT2 : undefined);
   const token0 = normalizeAddress(env.TOKEN0 && env.TOKEN0 !== "" ? env.TOKEN0 : undefined);
   const token1 = normalizeAddress(env.TOKEN1 && env.TOKEN1 !== "" ? env.TOKEN1 : undefined);
   const poolId = env.POOL_ID && env.POOL_ID !== "" ? env.POOL_ID : undefined;
@@ -152,6 +171,8 @@ export const loadConfig = async (): Promise<KeeperConfig> => {
     positionManagerAddress: positionManagerAddress as KeeperConfig["positionManagerAddress"],
     poolManagerAddress: poolManagerAddress as KeeperConfig["poolManagerAddress"],
     quoterAddress: quoterAddress as KeeperConfig["quoterAddress"],
+    swapRouterAddress: swapRouterAddress as KeeperConfig["swapRouterAddress"],
+    permit2Address: permit2Address as KeeperConfig["permit2Address"],
     token0: token0 as KeeperConfig["token0"],
     token1: token1 as KeeperConfig["token1"],
     chainId: parseNumber(env.CHAIN_ID, 11155111),

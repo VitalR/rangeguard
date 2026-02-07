@@ -1,10 +1,10 @@
 import { Token } from "@uniswap/sdk-core";
-import { keccak256 } from "viem";
+import { keccak256, parseUnits } from "viem";
 import { createClients } from "../clients";
 import { loadConfig } from "../config";
 import { rangeGuardVaultAbi } from "../abi/RangeGuardVault";
 import { getPoolKeyFromPosition, buildPoolFromState } from "../uniswap/pool";
-import { buildCollectUnlockData } from "../uniswap/planner";
+import { buildBurnPositionUnlockData } from "../uniswap/planner";
 import { checkPermit2Allowances } from "../uniswap/permit2";
 import { logger } from "../logger";
 import { deadlineFromNow } from "../utils/time";
@@ -14,16 +14,21 @@ import { createRunId, hashCalldata, outputReport, RunReport } from "../report";
 import { parseVaultEvents } from "../vault/events";
 import { fetchVaultState } from "../vault/state";
 import { selectPositionId } from "../vault/positions";
+import { positionManagerAbi } from "../abi/PositionManager";
 
-type CollectOptions = {
+type CloseOptions = {
   send?: boolean;
+  force?: boolean;
+  amount0Min?: string;
+  amount1Min?: string;
+  hookDataHex?: string;
   json?: boolean;
   out?: string;
   verbose?: boolean;
   positionId?: string;
 };
 
-export const collectCommand = async (options: CollectOptions = {}) => {
+export const closePositionCommand = async (options: CloseOptions = {}) => {
   try {
     const config = await loadConfig();
     const { publicClient, walletClient, account } = createClients(config);
@@ -36,18 +41,33 @@ export const collectCommand = async (options: CollectOptions = {}) => {
       config.vaultAddress,
       options.positionId
     );
-    const { state: stateBefore, context } = await fetchVaultState(config, publicClient, account, positionId);
+
+    const [{ state: stateBefore, context }, maxSlippageBps] = await Promise.all([
+      fetchVaultState(config, publicClient, account, positionId),
+      publicClient.readContract({
+        address: config.vaultAddress,
+        abi: rangeGuardVaultAbi,
+        functionName: "maxSlippageBps"
+      })
+    ]);
 
     if (!context.position?.initialized) {
       throw new KeeperError("Vault position not initialized");
     }
 
-    const positionManagerAddress = config.positionManagerAddress ?? context.positionManager;
+    if (config.policy.maxSlippageBps > Number(maxSlippageBps)) {
+      throw new KeeperError("policy.maxSlippageBps exceeds vault maxSlippageBps");
+    }
 
+    const lower = Number(context.position.lower);
+    const upper = Number(context.position.upper);
+
+    const positionManagerAddress = config.positionManagerAddress ?? context.positionManager;
     const poolKey = await getPoolKeyFromPosition(publicClient, positionManagerAddress, positionId);
+
     const token0Currency = new Token(config.chainId, context.token0, Number(context.token0Decimals));
     const token1Currency = new Token(config.chainId, context.token1, Number(context.token1Decimals));
-    const { pool, poolId } = await buildPoolFromState(
+    const { poolId } = await buildPoolFromState(
       publicClient,
       config.stateViewAddress,
       poolKey,
@@ -56,15 +76,33 @@ export const collectCommand = async (options: CollectOptions = {}) => {
       config.poolId
     );
 
-    const unlockData = buildCollectUnlockData({
+    if (options.force) {
+      logger.warn("Cooldown ignored due to --force", { action: "closePosition" });
+    } else {
+      await assertCooldown(config.policy, config.vaultAddress, "closePosition");
+    }
+
+    const amount0Min = options.amount0Min
+      ? parseUnits(options.amount0Min, Number(context.token0Decimals))
+      : 0n;
+    const amount1Min = options.amount1Min
+      ? parseUnits(options.amount1Min, Number(context.token1Decimals))
+      : 0n;
+    const hookDataRaw = options.hookDataHex ?? "0x";
+    if (!/^0x[0-9a-fA-F]*$/.test(hookDataRaw)) {
+      throw new KeeperError("hookDataHex must be hex");
+    }
+    const hookData = hookDataRaw as `0x${string}`;
+
+    const unlockData = buildBurnPositionUnlockData({
       tokenId: positionId,
-      hookData: config.policy.hookDataHex,
-      currency0: pool.currency0,
-      currency1: pool.currency1,
+      amount0Min,
+      amount1Min,
+      hookData,
+      currency0: poolKey.currency0,
+      currency1: poolKey.currency1,
       recipient: config.vaultAddress
     });
-
-    await assertCooldown(config.policy, config.vaultAddress, "collect");
 
     const deadline = deadlineFromNow(config.defaultDeadlineSeconds);
     const params = {
@@ -96,7 +134,7 @@ export const collectCommand = async (options: CollectOptions = {}) => {
     const simulation = await publicClient.simulateContract({
       address: config.vaultAddress,
       abi: rangeGuardVaultAbi,
-      functionName: "collect",
+      functionName: "closePosition",
       args: [params],
       account: account.address
     });
@@ -113,7 +151,7 @@ export const collectCommand = async (options: CollectOptions = {}) => {
     const runId = createRunId();
     const report: RunReport = {
       runId,
-      command: "collect",
+      command: "closePosition",
       createdAt: new Date().toISOString(),
       chainId,
       addresses: {
@@ -133,8 +171,10 @@ export const collectCommand = async (options: CollectOptions = {}) => {
       stateBefore,
       plan: {
         positionId: positionId.toString(),
-        deadline: params.deadline.toString(),
-        callValue: "0"
+        tickLower: lower,
+        tickUpper: upper,
+        amount0Min: amount0Min.toString(),
+        amount1Min: amount1Min.toString()
       }
     };
 
@@ -158,14 +198,45 @@ export const collectCommand = async (options: CollectOptions = {}) => {
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
     const { state: stateAfter } = await fetchVaultState(config, publicClient, account);
     const events = parseVaultEvents(receipt.logs, config.vaultAddress);
+    const positionIds = (await publicClient.readContract({
+      address: config.vaultAddress,
+      abi: rangeGuardVaultAbi,
+      functionName: "getPositionIds"
+    })) as bigint[];
+    const vaultCleared = !positionIds.some((id) => id === positionId);
+    let burned = false;
+    try {
+      await publicClient.readContract({
+        address: positionManagerAddress,
+        abi: positionManagerAbi,
+        functionName: "ownerOf",
+        args: [positionId]
+      });
+    } catch {
+      burned = true;
+    }
 
     report.tx = {
       dryRun: false,
       hash,
       blockNumber: receipt.blockNumber?.toString(),
-      events
+      events,
+      burned,
+      vaultCleared
     };
     report.stateAfter = stateAfter;
+
+    if (!vaultCleared) {
+      report.warnings = [...(report.warnings ?? []), "Vault still tracks position after close"];
+      logger.warn("Vault tracking still includes position", { positionId: positionId.toString() });
+    }
+    if (!burned) {
+      report.warnings = [
+        ...(report.warnings ?? []),
+        "Position token still exists; burn may not have executed"
+      ];
+      logger.warn("Position token still exists after close", { positionId: positionId.toString() });
+    }
 
     if (options.verbose) {
       report.debug = {
@@ -177,7 +248,7 @@ export const collectCommand = async (options: CollectOptions = {}) => {
     await outputReport(report, options);
     await recordAction(config.policy, config.vaultAddress);
   } catch (err) {
-    logger.error("Collect failed", { error: formatError(err) });
+    logger.error("Close position failed", { error: formatError(err) });
     throw err;
   }
 };

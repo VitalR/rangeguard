@@ -20,6 +20,8 @@ export interface KeeperConfig {
   positionManagerAddress?: Address;
   poolManagerAddress?: Address;
   quoterAddress?: Address;
+  swapRouterAddress?: Address;
+  permit2Address?: Address;
   token0?: Address;
   token1?: Address;
   chainId: number;
